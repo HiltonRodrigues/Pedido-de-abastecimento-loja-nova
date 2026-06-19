@@ -72,114 +72,196 @@ function loadLocal() {
 }
 
 // ---------------------------------------------------------------
-// Persistência na nuvem — sempre através do Worker (WORKER_URL fixo)
+// Persistência na nuvem — múltiplos bins (um por secção) via Worker
 // ---------------------------------------------------------------
-async function cloudRead() {
-  const res = await fetch(WORKER_URL, { method: 'GET' });
-  if (!res.ok) throw new Error('Falha ao ler dados da nuvem (' + res.status + ')');
+// O plano gratuito do JSONBin rejeita gravações acima de 100KB. Com 500+
+// artigos, um único bin com tudo facilmente excede esse limite. Por isso
+// cada secção grava no seu próprio bin (configurado dentro do Worker), e
+// usamos um formato compacto (arrays em vez de objetos com nomes de campo
+// repetidos) para reduzir ainda mais o tamanho de cada gravação.
+const SECTIONS = ['config', 'cardex', 'stock', 'vendas', 'pedido', 'servico', 'reforco'];
+
+async function cloudReadSection(section) {
+  const res = await fetch(`${WORKER_URL}?s=${section}`, { method: 'GET' });
+  if (!res.ok) throw new Error('Falha ao ler "' + section + '" da nuvem (' + res.status + ')');
   const j = await res.json();
   return j.record || j;
 }
 
-// Funde o record vindo da nuvem no STATE local, preservando defaults para
-// campos que possam não existir em registos gravados por versões anteriores.
-function mergeRemoteState(record) {
-  STATE.step = record.step ?? STATE.step;
-  STATE.storeName = record.storeName ?? STATE.storeName;
-  STATE.config = { ...STATE.config, ...(record.config || {}) };
-  STATE.cardex = { raw: null, fileName: record.cardex?.fileName || '', mapping: record.cardex?.mapping || {}, items: record.cardex?.items || [] };
-  STATE.stock = { raw: null, fileName: record.stock?.fileName || '', mapping: record.stock?.mapping || {}, items: record.stock?.items || [] };
-  STATE.vendas = {
-    raw: null, fileName: record.vendas?.fileName || '', mapping: record.vendas?.mapping || {},
-    items: record.vendas?.items || [], mediaPorArtigo: record.vendas?.mediaPorArtigo || {}, periodoDias: record.vendas?.periodoDias || 10
-  };
-  STATE.pedidoSugerido = record.pedidoSugerido || [];
-  STATE.pedidoFinal = record.pedidoFinal || [];
-  STATE.nivelServico = { raw: null, fileName: record.nivelServico?.fileName || '', mapping: record.nivelServico?.mapping || {}, items: record.nivelServico?.items || [] };
-  STATE.reforco = record.reforco || [];
-  STATE.history = record.history || [];
-}
-
-async function cloudWrite(data, attempt = 1) {
-  const res = await fetch(WORKER_URL, {
+async function cloudWriteSection(section, data, attempt = 1) {
+  const res = await fetch(`${WORKER_URL}?s=${section}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
   });
   if (!res.ok) {
-    // 403/429 a meio de uma rajada de gravações costuma ser um limite
-    // temporário de pedidos por minuto do JSONBin — esperar um pouco e
-    // tentar de novo costuma resolver sem qualquer ação do utilizador.
     if ((res.status === 403 || res.status === 429) && attempt < 4) {
       await new Promise(r => setTimeout(r, attempt * 1500));
-      return cloudWrite(data, attempt + 1);
+      return cloudWriteSection(section, data, attempt + 1);
     }
-    throw new Error('Falha ao gravar dados na nuvem (' + res.status + ')');
+    const bodyText = await res.text().catch(() => '');
+    let msg = 'Falha ao gravar "' + section + '" na nuvem (' + res.status + ')';
+    if (/100\s*kb/i.test(bodyText)) msg = 'A secção "' + section + '" excedeu 100KB no plano gratuito da nuvem. Reduza o número de artigos ou contacte o suporte para aumentar o limite.';
+    throw new Error(msg);
   }
   return res.json();
 }
 
-let saveTimer = null;
-let saveInFlight = false;
-let savePending = false;
-function scheduleCloudSave() {
-  saveLocal();
-  if (!STATE.jsonbin.connected) return;
-  clearTimeout(saveTimer);
-  setStoreTag('a gravar…', 'busy');
-  // Debounce generoso: se o utilizador estiver a editar várias linhas em
-  // sequência (ex: ajustar muitas quantidades), só gravamos depois de uma
-  // pausa, e nunca duas gravações em simultâneo — isto evita rajadas de
-  // pedidos que o plano gratuito da nuvem possa rejeitar temporariamente.
-  saveTimer = setTimeout(() => runCloudSave(), 1500);
+// --- Codificação compacta por secção (array-of-arrays) -------------------
+// Reduz drasticamente o tamanho gravado: sem nomes de campo repetidos a
+// cada item. A ordem de cada array é fixa e documentada abaixo.
+function encodeCardex(items) {
+  // [codigo, descricao, categoria, unidade, conversaoCaixas, numeroDispo]
+  return items.map(it => [it.codigo, it.descricao, it.categoria, it.unidade || '', it.conversaoCaixas || 1, it.numeroDispo || 0]);
+}
+function decodeCardex(rows) {
+  return (rows || []).map(r => ({ codigo: r[0], descricao: r[1], categoria: r[2], unidade: r[3], conversaoCaixas: r[4], numeroDispo: r[5] }));
+}
+function encodeStock(items) {
+  // [codigo, descricao, quantidade]
+  return items.map(it => [it.codigo, it.descricao || '', it.quantidade]);
+}
+function decodeStock(rows) {
+  return (rows || []).map(r => ({ codigo: r[0], descricao: r[1], quantidade: r[2] }));
+}
+// Pedido/serviço/reforço: guardamos só código + quantidades editáveis pelo
+// utilizador. Tudo o resto (descrição, categoria, venda média, etc.) é
+// recalculado a partir do Cardex + Stock + Vendas já guardados, ao restaurar.
+function encodePedido(items) {
+  // [codigo, qtdPedida]
+  return items.filter(it => it.qtdPedida > 0).map(it => [it.codigo, it.qtdPedida]);
+}
+function encodeServico(items) {
+  // [codigo, qtdServida]
+  return items.map(it => [it.codigo, it.qtdServida]);
+}
+function encodeReforco(items) {
+  // [codigo, qtdReforco]
+  return items.filter(it => it.qtdReforco > 0).map(it => [it.codigo, it.qtdReforco]);
 }
 
-async function runCloudSave() {
-  if (saveInFlight) { savePending = true; return; }
-  saveInFlight = true;
-  try {
-    const payload = exportableState();
-    const size = estimatePayloadSize(payload);
-    if (size > 950 * 1024) {
-      toast('Aviso: os dados deste ciclo (' + Math.round(size / 1024) + ' KB) estão perto do limite da nuvem (1MB). Considere aprovar o pedido/reforço e iniciar um novo ciclo para libertar espaço.', 'err');
+let saveTimers = {};
+let saveInFlight = {};
+let savePending = {};
+
+// Agenda a gravação de UMA secção (não todas) — assim editar o pedido não
+// regrava o Cardex inteiro, por exemplo.
+function scheduleCloudSave(section = 'all') {
+  saveLocal();
+  if (!STATE.jsonbin.connected) return;
+  const sections = section === 'all' ? SECTIONS : [section];
+  for (const s of sections) {
+    clearTimeout(saveTimers[s]);
+    setStoreTag('a gravar…', 'busy');
+    saveTimers[s] = setTimeout(() => runCloudSave(s), 1200);
+  }
+}
+
+function payloadForSection(section) {
+  switch (section) {
+    case 'config': return { storeName: STATE.storeName, config: STATE.config, step: STATE.step };
+    case 'cardex': return { fileName: STATE.cardex.fileName, mapping: STATE.cardex.mapping, i: encodeCardex(STATE.cardex.items) };
+    case 'stock': return { fileName: STATE.stock.fileName, mapping: STATE.stock.mapping, i: encodeStock(STATE.stock.items) };
+    case 'vendas': {
+      const { mediaPorArtigo } = STATE.vendas.items.length
+        ? calcularVendaMedia(STATE.vendas.items, STATE.config.janelaVendasDias, { lojaNova: STATE.config.lojaNova })
+        : { mediaPorArtigo: STATE.vendas.mediaPorArtigo || {} };
+      return { fileName: STATE.vendas.fileName, mapping: STATE.vendas.mapping, linhas: STATE.vendas.items.length, m: mediaPorArtigo };
     }
-    await cloudWrite(payload);
+    case 'pedido': return { i: encodePedido(STATE.pedidoFinal) };
+    case 'servico': return { fileName: STATE.nivelServico.fileName, mapping: STATE.nivelServico.mapping, i: encodeServico(STATE.nivelServico.items) };
+    case 'reforco': return { i: encodeReforco(STATE.reforco) };
+    default: return {};
+  }
+}
+
+async function runCloudSave(section) {
+  if (saveInFlight[section]) { savePending[section] = true; return; }
+  saveInFlight[section] = true;
+  try {
+    const payload = payloadForSection(section);
+    const size = estimatePayloadSize(payload);
+    if (size > 90 * 1024) {
+      toast('Aviso: a secção "' + section + '" tem ' + Math.round(size / 1024) + ' KB, perto do limite de 100KB do plano gratuito da nuvem.', 'err');
+    }
+    await cloudWriteSection(section, payload);
     setStoreTag(STATE.storeName || 'na nuvem', 'ok');
   } catch (e) {
     toast('Erro ao gravar na nuvem: ' + e.message, 'err');
     setStoreTag('erro ao gravar', 'err');
   } finally {
-    saveInFlight = false;
-    if (savePending) { savePending = false; setTimeout(() => runCloudSave(), 1500); }
+    saveInFlight[section] = false;
+    if (savePending[section]) { savePending[section] = false; setTimeout(() => runCloudSave(section), 1200); }
   }
 }
 
-function exportableState() {
-  // Não persistimos a chave API no bin (fica só local), tudo o resto sim,
-  // mas reduzimos agressivamente o payload para não exceder o limite de 1MB
-  // dos Bins normais do JSONBin:
-  //  - nunca persistimos `raw` (cópia bruta do Excel, só serve durante a sessão)
-  //  - vendas: persistimos apenas o agregado (venda média por artigo), não as
-  //    milhares de linhas de detalhe diário
-  //  - history: mantemos só os 5 snapshots mais recentes
-  const { jsonbin, ...rest } = STATE;
+// Lê todas as secções da nuvem e reconstrói o STATE local, recalculando os
+// campos derivados (pedido completo, nível de serviço completo, reforço
+// completo) a partir do código + quantidade guardados e do Cardex/Stock/
+// Vendas também já restaurados.
+async function readAllSections() {
+  const results = {};
+  for (const s of SECTIONS) {
+    try { results[s] = await cloudReadSection(s); }
+    catch (e) { results[s] = null; }
+  }
+  return results;
+}
 
-  const { mediaPorArtigo } = STATE.vendas.items.length
-    ? calcularVendaMedia(STATE.vendas.items, STATE.config.janelaVendasDias, { lojaNova: STATE.config.lojaNova })
-    : { mediaPorArtigo: {} };
+function mergeRemoteState(sections) {
+  const cfg = sections.config || {};
+  STATE.storeName = cfg.storeName ?? STATE.storeName;
+  STATE.config = { ...STATE.config, ...(cfg.config || {}) };
+  STATE.step = cfg.step ?? STATE.step;
 
-  return {
-    ...rest,
-    cardex: { fileName: STATE.cardex.fileName, mapping: STATE.cardex.mapping, items: STATE.cardex.items },
-    stock: { fileName: STATE.stock.fileName, mapping: STATE.stock.mapping, items: STATE.stock.items },
-    vendas: {
-      fileName: STATE.vendas.fileName, mapping: STATE.vendas.mapping,
-      linhas: STATE.vendas.items.length, mediaPorArtigo,
-      items: [], // detalhe não persistido na nuvem — recarregue o ficheiro se precisar de o ver de novo
-    },
-    nivelServico: { fileName: STATE.nivelServico.fileName, mapping: STATE.nivelServico.mapping, items: STATE.nivelServico.items },
-    history: STATE.history.slice(-5),
+  const cx = sections.cardex || {};
+  STATE.cardex = { raw: null, fileName: cx.fileName || '', mapping: cx.mapping || {}, items: decodeCardex(cx.i) };
+
+  const st = sections.stock || {};
+  STATE.stock = { raw: null, fileName: st.fileName || '', mapping: st.mapping || {}, items: decodeStock(st.i) };
+
+  const vd = sections.vendas || {};
+  STATE.vendas = {
+    raw: null, fileName: vd.fileName || '', mapping: vd.mapping || {},
+    items: [], mediaPorArtigo: vd.m || {}, periodoDias: STATE.config.janelaVendasDias,
   };
+
+  // Reconstrói o pedido completo a partir do código+qtdPedida guardados,
+  // juntando com os dados do Cardex/Stock/Vendas já restaurados acima.
+  const pd = sections.pedido || {};
+  if (pd.i && pd.i.length && STATE.cardex.items.length) {
+    const qtdPorCodigo = {}; (pd.i || []).forEach(([codigo, qtd]) => qtdPorCodigo[normKey(codigo)] = qtd);
+    const baseSugerido = gerarPedidoSugerido({
+      cardex: STATE.cardex.items, stock: STATE.stock.items, mediaPorArtigo: STATE.vendas.mediaPorArtigo,
+      coberturaDias: STATE.config.coberturaObjDias,
+    });
+    STATE.pedidoSugerido = baseSugerido;
+    STATE.pedidoFinal = baseSugerido.map(p => ({ ...p, qtdPedida: qtdPorCodigo.hasOwnProperty(normKey(p.codigo)) ? qtdPorCodigo[normKey(p.codigo)] : 0 }));
+  } else {
+    STATE.pedidoSugerido = []; STATE.pedidoFinal = [];
+  }
+
+  // Reconstrói o nível de serviço a partir do código+qtdServida guardados.
+  const sv = sections.servico || {};
+  if (sv.i && sv.i.length && STATE.pedidoFinal.length) {
+    const servidoPorCodigo = {}; (sv.i || []).forEach(([codigo, qtd]) => servidoPorCodigo[normKey(codigo)] = qtd);
+    const servidoItems = Object.keys(servidoPorCodigo).map(k => ({ codigo: k, quantidade: servidoPorCodigo[k] }));
+    STATE.nivelServico = { raw: null, fileName: sv.fileName || '', mapping: sv.mapping || {}, items: calcularNivelServico(STATE.pedidoFinal, servidoItems) };
+  } else {
+    STATE.nivelServico = { raw: null, fileName: '', mapping: {}, items: [] };
+  }
+
+  // Reconstrói o reforço a partir do código+qtdReforco guardados.
+  const rf = sections.reforco || {};
+  if (rf.i && rf.i.length && STATE.nivelServico.items.length) {
+    const reforcoPorCodigo = {}; (rf.i || []).forEach(([codigo, qtd]) => reforcoPorCodigo[normKey(codigo)] = qtd);
+    const base = gerarSugestaoReforco(STATE.nivelServico.items, { pesoCategoria: STATE.config.pesoCategoriaReforco });
+    STATE.reforco = base.map(r => ({ ...r, qtdReforco: reforcoPorCodigo.hasOwnProperty(normKey(r.codigo)) ? reforcoPorCodigo[normKey(r.codigo)] : r.qtdReforco }));
+  } else {
+    STATE.reforco = [];
+  }
+
+  STATE.history = STATE.history || [];
 }
 
 function estimatePayloadSize(obj) {
@@ -628,7 +710,7 @@ function renderConfigScreen(root) {
     STATE.config.pesoCategoriaReforco = Math.min(1, Math.max(0, Number(document.getElementById('inpPeso').value)));
     STATE.config.lojaNova = document.getElementById('inpLojaNova').checked;
     STATE.storeName = document.getElementById('inpStoreName').value.trim();
-    scheduleCloudSave();
+    scheduleCloudSave('config');
     toast('Parâmetros guardados.', 'ok');
     setStoreTag(STATE.storeName || (STATE.jsonbin.connected ? 'na nuvem' : 'sem ligação a dados'));
   });
@@ -645,15 +727,16 @@ async function connectCloud() {
   const statusEl = document.getElementById('connStatus');
   if (statusEl) statusEl.innerHTML = `<div class="banner info"><span class="spinner"></span> A ligar à nuvem…</div>`;
   try {
-    const record = await cloudRead();
-    STATE.jsonbin.connected = true; // a leitura teve sucesso — a ligação está ok
-    if (record && Object.keys(record).length) {
-      mergeRemoteState(record);
+    const sections = await readAllSections();
+    STATE.jsonbin.connected = true; // pelo menos a tentativa de leitura correu sem exceção — a ligação está ok
+    const hasAnyData = Object.values(sections).some(r => r && Object.keys(r).length);
+    if (hasAnyData) {
+      mergeRemoteState(sections);
     } else {
-      // Bin vazio: grava o estado inicial, mas isto passa pelo mesmo
-      // caminho com retry/fila das gravações normais, e uma falha aqui
-      // não deve impedir gravações futuras.
-      scheduleCloudSave();
+      // Bin(s) vazio(s): grava o estado inicial de todas as secções, mas
+      // isto passa pelo mesmo caminho com retry/fila das gravações
+      // normais, e uma falha aqui não deve impedir gravações futuras.
+      scheduleCloudSave('all');
     }
     setStoreTag(STATE.storeName || 'na nuvem', 'ok');
     saveLocal();
@@ -684,7 +767,7 @@ function onResetAll() {
   STATE.pedidoFinal = [];
   STATE.nivelServico = { raw: null, fileName: '', mapping: {}, items: [] };
   STATE.reforco = [];
-  scheduleCloudSave();
+  scheduleCloudSave('stock'); scheduleCloudSave('vendas'); scheduleCloudSave('pedido'); scheduleCloudSave('servico'); scheduleCloudSave('reforco');
   render();
   toast('Ciclo reposto.', 'ok');
 }
@@ -880,7 +963,7 @@ function renderCardexScreen(root) {
           conversaoCaixas: r.conversaoCaixas > 0 ? r.conversaoCaixas : 1,
         }));
       STATE.cardex.items = items;
-      scheduleCloudSave();
+      scheduleCloudSave('cardex');
       toast(`Cardex carregado: ${items.length} artigos.`, 'ok');
       render();
     }
@@ -972,7 +1055,7 @@ function renderCardexTable(container) {
         const newVal = el.textContent.trim() || '—';
         if (it && it.categoria !== newVal) {
           it.categoria = newVal;
-          scheduleCloudSave();
+          scheduleCloudSave('cardex');
         }
       });
       el.addEventListener('keydown', (e) => {
@@ -993,7 +1076,7 @@ function renderCardexTable(container) {
     if (!to) return;
     let count = 0;
     items.forEach(i => { if (i.categoria === from) { i.categoria = to.trim(); count++; } });
-    scheduleCloudSave();
+    scheduleCloudSave('cardex');
     toast(`${count} artigo(s) movido(s) de "${from}" para "${to}".`, 'ok');
     renderCardexTable(container);
   });
@@ -1003,7 +1086,6 @@ function renderCardexTable(container) {
   btnRow.innerHTML = `<button class="btn accent" id="btnGoStock">Avançar para Stock →</button>`;
   container.querySelector('.panel').appendChild(btnRow);
   document.getElementById('btnGoStock').addEventListener('click', () => {
-    scheduleCloudSave();
     goTo(2);
   });
 }
@@ -1041,7 +1123,7 @@ function renderStockScreen(root) {
     onParsed: () => {
       const items = applyMapping(STATE.stock.raw.rows, STATE.stock.mapping, STOCK_FIELDS).filter(r => r.codigo);
       STATE.stock.items = items;
-      scheduleCloudSave();
+      scheduleCloudSave('stock');
       toast(`Stock carregado: ${items.length} linhas.`, 'ok');
       render();
     }
@@ -1138,7 +1220,7 @@ function renderVendasScreen(root) {
       const items = applyMapping(STATE.vendas.raw.rows, STATE.vendas.mapping, VENDAS_FIELDS)
         .filter(r => r.codigo && r.data);
       STATE.vendas.items = items;
-      scheduleCloudSave();
+      scheduleCloudSave('vendas');
       toast(`Vendas carregadas: ${items.length} linhas.`, 'ok');
       render();
     }
@@ -1181,7 +1263,7 @@ function renderVendasTable(container) {
           Janela considerada: <b>${janelaLabel}</b> (${STATE.config.janelaVendasDias} dias). Pode ajustar a janela no passo 0.
         </div>` : `
         <div class="banner warn">
-          ⚠ Este ciclo foi restaurado da nuvem: apenas a <b>venda média por artigo</b> foi guardada (o detalhe diário não é persistido no JSONBin para manter o ficheiro dentro do limite de 1MB).
+          ⚠ Este ciclo foi restaurado da nuvem: apenas a <b>venda média por artigo</b> foi guardada (o detalhe diário não é persistido, para manter cada gravação dentro do limite do plano gratuito).
           Pode prosseguir normalmente para o pedido com os valores já calculados, ou recarregar o ficheiro de vendas se quiser alterar a janela.
         </div>`}
       <div class="stats">
@@ -1238,7 +1320,7 @@ function renderVendasTable(container) {
       coberturaDias: STATE.config.coberturaObjDias,
     });
     STATE.pedidoFinal = STATE.pedidoSugerido.map(p => ({ ...p }));
-    scheduleCloudSave();
+    scheduleCloudSave('pedido');
     goTo(4);
   });
 }
@@ -1357,7 +1439,7 @@ function renderPedidoScreen(root) {
         const v = Math.max(0, Number(inp.value) || 0);
         it.qtdPedida = v;
         inp.value = v;
-        scheduleCloudSave();
+        scheduleCloudSave('pedido');
       });
     });
   }
@@ -1376,7 +1458,7 @@ function renderPedidoScreen(root) {
       coberturaDias: STATE.config.coberturaObjDias,
     });
     STATE.pedidoFinal = STATE.pedidoSugerido.map(p => ({ ...p }));
-    scheduleCloudSave();
+    scheduleCloudSave('pedido');
     render();
     toast('Sugestão recalculada.', 'ok');
   });
@@ -1405,7 +1487,7 @@ function renderPedidoScreen(root) {
 
   document.getElementById('btnApprovePedido').addEventListener('click', () => {
     STATE.history.push({ tipo: 'pedido', data: new Date().toISOString(), itens: JSON.parse(JSON.stringify(STATE.pedidoFinal)) });
-    scheduleCloudSave();
+    scheduleCloudSave('pedido');
     toast('Pedido aprovado. Pode agora carregar o nível de serviço.', 'ok');
     goTo(5);
   });
@@ -1450,7 +1532,7 @@ function renderServicoScreen(root) {
       const servidoItems = applyMapping(STATE.nivelServico.raw.rows, STATE.nivelServico.mapping, SERVICO_FIELDS)
         .filter(r => r.codigo);
       STATE.nivelServico.items = calcularNivelServico(STATE.pedidoFinal, servidoItems);
-      scheduleCloudSave();
+      scheduleCloudSave('servico');
       toast(`Nível de serviço calculado para ${STATE.nivelServico.items.length} artigos.`, 'ok');
       render();
     }
@@ -1535,7 +1617,7 @@ function renderServicoTable(container) {
     STATE.reforco = gerarSugestaoReforco(STATE.nivelServico.items, {
       pesoCategoria: STATE.config.pesoCategoriaReforco,
     });
-    scheduleCloudSave();
+    scheduleCloudSave('reforco');
     goTo(6);
   });
 }
@@ -1643,7 +1725,7 @@ function renderReforcoScreen(root) {
         const it = items.find(i => i.codigo === inp.dataset.code);
         it.qtdReforco = Math.max(0, Number(inp.value) || 0);
         inp.value = it.qtdReforco;
-        scheduleCloudSave();
+        scheduleCloudSave('reforco');
       });
     });
   }
@@ -1655,7 +1737,7 @@ function renderReforcoScreen(root) {
   document.getElementById('btnRecalcReforco').addEventListener('click', () => {
     if (!confirm('Isto substitui as edições pela sugestão original. Continuar?')) return;
     STATE.reforco = gerarSugestaoReforco(STATE.nivelServico.items, { pesoCategoria: STATE.config.pesoCategoriaReforco });
-    scheduleCloudSave();
+    scheduleCloudSave('reforco');
     render();
     toast('Reforço recalculado.', 'ok');
   });
@@ -1688,7 +1770,7 @@ function renderReforcoScreen(root) {
     STATE.pedidoFinal = [];
     STATE.nivelServico = { raw: null, fileName: '', mapping: {}, items: [] };
     STATE.reforco = [];
-    scheduleCloudSave();
+    scheduleCloudSave('stock'); scheduleCloudSave('vendas'); scheduleCloudSave('pedido'); scheduleCloudSave('servico'); scheduleCloudSave('reforco');
     toast('Novo ciclo iniciado. Carregue o stock atualizado.', 'ok');
     goTo(2);
   });
