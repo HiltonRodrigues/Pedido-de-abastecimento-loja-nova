@@ -1,13 +1,18 @@
 /* ============================================================
    Cardex ⇄ Pedido — núcleo da aplicação
-   Persistência: JSONBin.io | Leitura de Excel: SheetJS
+   Persistência: JSONBin.io via Cloudflare Worker | Leitura de Excel: SheetJS
    ============================================================ */
+
+// URL fixo do Cloudflare Worker que faz a ponte com o JSONBin.
+// Não é preciso nenhuma configuração pelo utilizador — a app liga-se
+// automaticamente a este endereço ao abrir.
+const WORKER_URL = 'https://cardex-pedido-api.rodrigueshilton13.workers.dev';
 
 const STORAGE_LOCAL_KEY = 'cardex_pedido_local_v1';
 
 const STATE = {
   step: 0,
-  jsonbin: { apiKey: '', binId: '', workerUrl: '', connected: false },
+  jsonbin: { connected: false },
   storeName: '',
   config: {
     coberturaObjDias: 10,
@@ -66,59 +71,13 @@ function loadLocal() {
 }
 
 // ---------------------------------------------------------------
-// JSONBin.io integration
+// Persistência na nuvem — sempre através do Worker (WORKER_URL fixo)
 // ---------------------------------------------------------------
-// Por padrão a app fala diretamente com o JSONBin. Se o JSONBin bloquear o
-// pedido do navegador por CORS (acontece de forma intermitente em alguns
-// domínios), o utilizador pode preencher STATE.jsonbin.workerUrl com o URL
-// de um Cloudflare Worker (ver instruções no README) que faz a ponte
-// servidor-a-servidor, sem essa restrição.
-const JSONBIN_BASE = 'https://api.jsonbin.io/v3';
-
-function usingWorkerProxy() {
-  return !!(STATE.jsonbin.workerUrl && STATE.jsonbin.workerUrl.trim());
-}
-
-async function jsonbinCreateBin(apiKey, data, name) {
-  if (usingWorkerProxy()) {
-    // O Worker já sabe o BIN_ID e a API_KEY (estão no código dele), por isso
-    // "criar" aqui equivale a gravar o estado inicial nesse bin fixo.
-    const res = await fetch(STATE.jsonbin.workerUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error('Falha ao gravar via Worker (' + res.status + ')');
-    return 'worker';
-  }
-  const res = await fetch(`${JSONBIN_BASE}/b`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Master-Key': apiKey,
-      'X-Bin-Name': name || 'cardex-pedido',
-      'X-Bin-Private': 'true'
-    },
-    body: JSON.stringify(data)
-  });
-  if (!res.ok) throw new Error('Falha ao criar bin (' + res.status + ')');
+async function cloudRead() {
+  const res = await fetch(WORKER_URL, { method: 'GET' });
+  if (!res.ok) throw new Error('Falha ao ler dados da nuvem (' + res.status + ')');
   const j = await res.json();
-  return j.metadata.id;
-}
-
-async function jsonbinRead(apiKey, binId) {
-  if (usingWorkerProxy()) {
-    const res = await fetch(STATE.jsonbin.workerUrl, { method: 'GET' });
-    if (!res.ok) throw new Error('Falha ao ler via Worker (' + res.status + ')');
-    const j = await res.json();
-    return j.record || j;
-  }
-  const res = await fetch(`${JSONBIN_BASE}/b/${binId}/latest`, {
-    headers: { 'X-Master-Key': apiKey }
-  });
-  if (!res.ok) throw new Error('Falha ao ler bin (' + res.status + ')');
-  const j = await res.json();
-  return j.record;
+  return j.record || j;
 }
 
 // Funde o record vindo da nuvem no STATE local, preservando defaults para
@@ -140,25 +99,13 @@ function mergeRemoteState(record) {
   STATE.history = record.history || [];
 }
 
-async function jsonbinWrite(apiKey, binId, data) {
-  if (usingWorkerProxy()) {
-    const res = await fetch(STATE.jsonbin.workerUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    });
-    if (!res.ok) throw new Error('Falha ao gravar via Worker (' + res.status + ')');
-    return res.json();
-  }
-  const res = await fetch(`${JSONBIN_BASE}/b/${binId}`, {
+async function cloudWrite(data) {
+  const res = await fetch(WORKER_URL, {
     method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Master-Key': apiKey
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
   });
-  if (!res.ok) throw new Error('Falha ao gravar bin (' + res.status + ')');
+  if (!res.ok) throw new Error('Falha ao gravar dados na nuvem (' + res.status + ')');
   return res.json();
 }
 
@@ -173,12 +120,12 @@ function scheduleCloudSave() {
       const payload = exportableState();
       const size = estimatePayloadSize(payload);
       if (size > 950 * 1024) {
-        toast('Aviso: os dados deste ciclo (' + Math.round(size / 1024) + ' KB) estão perto do limite do JSONBin (1MB). Considere aprovar o pedido/reforço e iniciar um novo ciclo para libertar espaço.', 'err');
+        toast('Aviso: os dados deste ciclo (' + Math.round(size / 1024) + ' KB) estão perto do limite da nuvem (1MB). Considere aprovar o pedido/reforço e iniciar um novo ciclo para libertar espaço.', 'err');
       }
-      await jsonbinWrite(STATE.jsonbin.apiKey, STATE.jsonbin.binId, payload);
-      setStoreTag(STATE.storeName || STATE.jsonbin.binId, 'ok');
+      await cloudWrite(payload);
+      setStoreTag(STATE.storeName || 'na nuvem', 'ok');
     } catch (e) {
-      toast('Erro ao gravar no JSONBin: ' + e.message, 'err');
+      toast('Erro ao gravar na nuvem: ' + e.message, 'err');
       setStoreTag('erro ao gravar', 'err');
     }
   }, 900);
@@ -550,8 +497,8 @@ function renderConfigScreen(root) {
       <div class="panel-head">
         <div>
           <span class="eyebrow">Passo 0</span>
-          <h2>Ligação de dados</h2>
-          <p>Esta app guarda o trabalho num bin do JSONBin.io para poder continuar noutro computador ou amanhã. A chave API fica só neste navegador — nunca é gravada na nuvem.</p>
+          <h2>Loja e parâmetros</h2>
+          <p>O trabalho é guardado automaticamente na nuvem — pode continuar noutro computador ou amanhã sem fazer mais nada aqui.</p>
         </div>
       </div>
 
@@ -560,27 +507,6 @@ function renderConfigScreen(root) {
           <div class="field-row">
             <label class="field">Nome da loja / armazém</label>
             <input type="text" id="inpStoreName" placeholder="Ex: Palanca" value="${escapeHtml(STATE.storeName)}">
-          </div>
-          <div class="field-row">
-            <label class="field">Chave API JSONBin (X-Master-Key)</label>
-            <input type="password" id="inpApiKey" placeholder="$2a$10$..." value="${escapeHtml(STATE.jsonbin.apiKey)}">
-            <div class="help">Crie gratuitamente em <a href="https://jsonbin.io" target="_blank" rel="noopener">jsonbin.io</a> → Account → API Keys.</div>
-          </div>
-          <div class="field-row">
-            <label class="field">Bin ID (deixe vazio para criar um novo)</label>
-            <input type="text" id="inpBinId" placeholder="ex: 64f1a2b3c45d6e7f8a9b0c1d" value="${escapeHtml(STATE.jsonbin.binId)}" ${usingWorkerProxy() ? 'disabled' : ''}>
-          </div>
-          <details style="margin-bottom:14px;">
-            <summary style="cursor:pointer;font-size:12px;font-weight:600;color:#4d4738;">Avançado: usar um Cloudflare Worker (só se o JSONBin der erro 403 por bloqueio de CORS)</summary>
-            <div class="field-row" style="margin-top:10px;">
-              <label class="field">URL do Cloudflare Worker</label>
-              <input type="text" id="inpWorkerUrl" placeholder="https://o-seu-worker.workers.dev" value="${escapeHtml(STATE.jsonbin.workerUrl || '')}">
-              <div class="help">Se preencher isto, a app passa a falar com o JSONBin através do seu Worker em vez de diretamente — resolve bloqueios de CORS. Deixe vazio para o comportamento normal. Ver instruções no README.</div>
-            </div>
-          </details>
-          <div class="btn-row">
-            <button class="btn accent" id="btnConnect">Ligar / Criar bin</button>
-            <button class="btn secondary" id="btnDisconnect" ${STATE.jsonbin.connected ? '' : 'disabled'}>Desligar</button>
           </div>
           <div id="connStatus"></div>
         </div>
@@ -640,8 +566,6 @@ function renderConfigScreen(root) {
     </div>` : ''}
   `;
 
-  document.getElementById('btnConnect').addEventListener('click', onConnectJsonbin);
-  document.getElementById('btnDisconnect').addEventListener('click', onDisconnectJsonbin);
   document.getElementById('btnSaveParams').addEventListener('click', () => {
     STATE.config.coberturaObjDias = Number(document.getElementById('inpCobertura').value) || 10;
     STATE.config.janelaVendasDias = Number(document.getElementById('inpJanela').value) || 10;
@@ -649,70 +573,43 @@ function renderConfigScreen(root) {
     STATE.storeName = document.getElementById('inpStoreName').value.trim();
     scheduleCloudSave();
     toast('Parâmetros guardados.', 'ok');
-    setStoreTag(STATE.storeName || (STATE.jsonbin.connected ? STATE.jsonbin.binId : 'sem ligação a dados'));
+    setStoreTag(STATE.storeName || (STATE.jsonbin.connected ? 'na nuvem' : 'sem ligação a dados'));
   });
 
   const resetBtn = document.getElementById('btnResetAll');
   if (resetBtn) resetBtn.addEventListener('click', onResetAll);
 }
 
-async function onConnectJsonbin() {
-  const apiKey = document.getElementById('inpApiKey').value.trim();
-  let binId = document.getElementById('inpBinId').value.trim();
-  const storeName = document.getElementById('inpStoreName').value.trim();
-  const workerUrl = document.getElementById('inpWorkerUrl').value.trim();
+// Liga-se automaticamente à nuvem (via Worker) ao abrir a app — sem
+// qualquer chave, ID ou URL pedido ao utilizador. Se já houver dados
+// guardados remotamente, são carregados; caso contrário, o estado atual
+// (eventualmente vazio) é gravado, servindo de ponto de partida.
+async function connectCloud() {
   const statusEl = document.getElementById('connStatus');
-  const viaWorker = !!workerUrl;
-
-  if (!viaWorker && !apiKey) { toast('Indique a chave API do JSONBin (ou um URL de Worker no modo avançado).', 'err'); return; }
-
-  STATE.jsonbin.workerUrl = workerUrl;
-
-  statusEl.innerHTML = `<div class="banner info"><span class="spinner"></span> A ligar ${viaWorker ? 'ao Worker' : 'ao JSONBin'}…</div>`;
+  if (statusEl) statusEl.innerHTML = `<div class="banner info"><span class="spinner"></span> A ligar à nuvem…</div>`;
   try {
-    if (viaWorker) {
-      // No modo Worker o bin é fixo (definido dentro do código do Worker),
-      // por isso lemos sempre o que já lá estiver — se estiver vazio, gravamos o estado atual.
-      try {
-        const record = await jsonbinRead(apiKey, binId);
-        if (record && Object.keys(record).length) mergeRemoteState(record);
-        else await jsonbinWrite(apiKey, binId, exportableState());
-      } catch (e) {
-        await jsonbinWrite(apiKey, binId, exportableState());
-      }
-      binId = binId || 'via-worker';
-    } else if (binId) {
-      const record = await jsonbinRead(apiKey, binId);
+    const record = await cloudRead();
+    if (record && Object.keys(record).length) {
       mergeRemoteState(record);
     } else {
-      binId = await jsonbinCreateBin(apiKey, exportableState(), storeName || 'cardex-pedido');
-      toast('Novo bin criado: ' + binId, 'ok');
+      await cloudWrite(exportableState());
     }
-    STATE.jsonbin = { apiKey, binId, workerUrl, connected: true };
-    STATE.storeName = storeName || STATE.storeName;
-    setStoreTag(STATE.storeName || (viaWorker ? 'via Worker' : binId), 'ok');
+    STATE.jsonbin.connected = true;
+    setStoreTag(STATE.storeName || 'na nuvem', 'ok');
     saveLocal();
-    statusEl.innerHTML = viaWorker
-      ? `<div class="banner info">Ligado através do Worker. Os dados estão a gravar no bin configurado dentro do código do Worker.</div>`
-      : `<div class="banner info">Ligado ao bin <b>${escapeHtml(binId)}</b>. Guarde este ID para continuar mais tarde noutro dispositivo.</div>`;
+    if (statusEl) statusEl.innerHTML = `<div class="banner info">Ligado à nuvem. O trabalho é guardado automaticamente.</div>`;
     render();
   } catch (e) {
-    const friendly = /failed to fetch/i.test(e.message)
-      ? (viaWorker
-          ? 'Não foi possível contactar o Worker. Verifique se o URL está correto e se o Worker foi publicado (Deploy) no Cloudflare.'
-          : 'Não foi possível contactar o JSONBin diretamente — isto costuma ser um bloqueio de CORS do lado do JSONBin. Experimente a opção "Avançado: usar um Cloudflare Worker" abaixo do Bin ID.')
-      : e.message;
-    statusEl.innerHTML = `<div class="banner danger">${escapeHtml(friendly)}</div>`;
-    toast('Não foi possível ligar.', 'err');
+    STATE.jsonbin.connected = false;
+    setStoreTag('sem ligação à nuvem', 'err');
+    if (statusEl) {
+      const friendly = /failed to fetch/i.test(e.message)
+        ? 'Não foi possível contactar o servidor de dados. Verifique a ligação à internet e tente recarregar a página.'
+        : e.message;
+      statusEl.innerHTML = `<div class="banner danger">${escapeHtml(friendly)}</div>`;
+    }
+    toast('Sem ligação à nuvem — a trabalhar só neste navegador por agora.', 'err');
   }
-}
-
-function onDisconnectJsonbin() {
-  STATE.jsonbin = { apiKey: '', binId: '', workerUrl: '', connected: false };
-  setStoreTag('sem ligação a dados');
-  saveLocal();
-  render();
-  toast('Desligado. Os dados continuam guardados localmente neste navegador.');
 }
 
 function onResetAll() {
@@ -1732,10 +1629,7 @@ function renderReforcoScreen(root) {
 
 (function init() {
   loadLocal();
-  if (STATE.jsonbin.connected && STATE.jsonbin.binId) {
-    setStoreTag(STATE.storeName || STATE.jsonbin.binId, 'ok');
-  } else {
-    setStoreTag('sem ligação a dados');
-  }
+  setStoreTag(STATE.storeName || 'a ligar à nuvem…', 'busy');
   render();
+  connectCloud();
 })();
