@@ -18,6 +18,7 @@ const STATE = {
     coberturaObjDias: 10,
     janelaVendasDias: 10,
     pesoCategoriaReforco: 0.5, // 0..1 — quanto menor, mais reduz o reforço de artigos da mesma categoria já bem servidos
+    lojaNova: false, // true = calcula a venda média a partir de outras lojas (rede ÷ nº de lojas que venderam), para loja sem histórico próprio
   },
   cardex: { raw: null, fileName: '', mapping: {}, items: [] },
   stock: { raw: null, fileName: '', mapping: {}, items: [] },
@@ -99,36 +100,58 @@ function mergeRemoteState(record) {
   STATE.history = record.history || [];
 }
 
-async function cloudWrite(data) {
+async function cloudWrite(data, attempt = 1) {
   const res = await fetch(WORKER_URL, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
   });
-  if (!res.ok) throw new Error('Falha ao gravar dados na nuvem (' + res.status + ')');
+  if (!res.ok) {
+    // 403/429 a meio de uma rajada de gravações costuma ser um limite
+    // temporário de pedidos por minuto do JSONBin — esperar um pouco e
+    // tentar de novo costuma resolver sem qualquer ação do utilizador.
+    if ((res.status === 403 || res.status === 429) && attempt < 4) {
+      await new Promise(r => setTimeout(r, attempt * 1500));
+      return cloudWrite(data, attempt + 1);
+    }
+    throw new Error('Falha ao gravar dados na nuvem (' + res.status + ')');
+  }
   return res.json();
 }
 
 let saveTimer = null;
+let saveInFlight = false;
+let savePending = false;
 function scheduleCloudSave() {
   saveLocal();
   if (!STATE.jsonbin.connected) return;
   clearTimeout(saveTimer);
   setStoreTag('a gravar…', 'busy');
-  saveTimer = setTimeout(async () => {
-    try {
-      const payload = exportableState();
-      const size = estimatePayloadSize(payload);
-      if (size > 950 * 1024) {
-        toast('Aviso: os dados deste ciclo (' + Math.round(size / 1024) + ' KB) estão perto do limite da nuvem (1MB). Considere aprovar o pedido/reforço e iniciar um novo ciclo para libertar espaço.', 'err');
-      }
-      await cloudWrite(payload);
-      setStoreTag(STATE.storeName || 'na nuvem', 'ok');
-    } catch (e) {
-      toast('Erro ao gravar na nuvem: ' + e.message, 'err');
-      setStoreTag('erro ao gravar', 'err');
+  // Debounce generoso: se o utilizador estiver a editar várias linhas em
+  // sequência (ex: ajustar muitas quantidades), só gravamos depois de uma
+  // pausa, e nunca duas gravações em simultâneo — isto evita rajadas de
+  // pedidos que o plano gratuito da nuvem possa rejeitar temporariamente.
+  saveTimer = setTimeout(() => runCloudSave(), 1500);
+}
+
+async function runCloudSave() {
+  if (saveInFlight) { savePending = true; return; }
+  saveInFlight = true;
+  try {
+    const payload = exportableState();
+    const size = estimatePayloadSize(payload);
+    if (size > 950 * 1024) {
+      toast('Aviso: os dados deste ciclo (' + Math.round(size / 1024) + ' KB) estão perto do limite da nuvem (1MB). Considere aprovar o pedido/reforço e iniciar um novo ciclo para libertar espaço.', 'err');
     }
-  }, 900);
+    await cloudWrite(payload);
+    setStoreTag(STATE.storeName || 'na nuvem', 'ok');
+  } catch (e) {
+    toast('Erro ao gravar na nuvem: ' + e.message, 'err');
+    setStoreTag('erro ao gravar', 'err');
+  } finally {
+    saveInFlight = false;
+    if (savePending) { savePending = false; setTimeout(() => runCloudSave(), 1500); }
+  }
 }
 
 function exportableState() {
@@ -142,7 +165,7 @@ function exportableState() {
   const { jsonbin, ...rest } = STATE;
 
   const { mediaPorArtigo } = STATE.vendas.items.length
-    ? calcularVendaMedia(STATE.vendas.items, STATE.config.janelaVendasDias)
+    ? calcularVendaMedia(STATE.vendas.items, STATE.config.janelaVendasDias, { lojaNova: STATE.config.lojaNova })
     : { mediaPorArtigo: {} };
 
   return {
@@ -278,11 +301,37 @@ function asDate(v) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-function calcularVendaMedia(vendasItemsRaw, janelaDias) {
+function calcularVendaMedia(vendasItemsRaw, janelaDias, opts = {}) {
+  const { lojaNova = false } = opts;
   const vendasItems = vendasItemsRaw.map(v => ({ ...v, data: asDate(v.data) })).filter(v => v.data);
   const hoje = vendasItems.reduce((max, v) => v.data > max ? v.data : max, new Date(0));
   const limite = new Date(hoje);
   limite.setDate(limite.getDate() - janelaDias + 1);
+
+  if (lojaNova) {
+    // Loja sem histórico próprio: a venda esperada por artigo é a média das
+    // lojas que já vendem esse artigo — soma-se a venda de todas as lojas
+    // no período, divide-se pelos dias (venda média diária da rede) e
+    // depois pelo número de lojas distintas que tiveram movimento desse
+    // artigo (não todas as lojas da rede, só as que venderam).
+    const porArtigo = {}; // { total, lojas:Set }
+    for (const v of vendasItems) {
+      if (v.data < limite) continue;
+      const k = normKey(v.codigo);
+      if (!porArtigo[k]) porArtigo[k] = { total: 0, lojas: new Set() };
+      porArtigo[k].total += v.quantidade;
+      porArtigo[k].lojas.add(normKey(v.loja || 'SEM_LOJA'));
+    }
+    const out = {};
+    const nLojasPorArtigo = {};
+    for (const k in porArtigo) {
+      const nLojas = porArtigo[k].lojas.size || 1;
+      const mediaRede = porArtigo[k].total / janelaDias; // venda média diária somada de todas as lojas
+      out[k] = mediaRede / nLojas; // venda média diária esperada para 1 loja (a nova)
+      nLojasPorArtigo[k] = nLojas;
+    }
+    return { mediaPorArtigo: out, dataLimite: limite, dataMax: hoje, nLojasPorArtigo, lojaNova: true };
+  }
 
   const porArtigo = {};
   for (const v of vendasItems) {
@@ -296,7 +345,7 @@ function calcularVendaMedia(vendasItemsRaw, janelaDias) {
   for (const k in porArtigo) {
     out[k] = porArtigo[k].total / janelaDias; // média sobre a janela total de dias (não só dias com venda)
   }
-  return { mediaPorArtigo: out, dataLimite: limite, dataMax: hoje };
+  return { mediaPorArtigo: out, dataLimite: limite, dataMax: hoje, lojaNova: false };
 }
 
 // --- 2) Sugestão de pedido --------------------------------------------
@@ -523,6 +572,13 @@ function renderConfigScreen(root) {
             <div class="help">Por norma 10 dias, conforme pedido.</div>
           </div>
           <div class="field-row">
+            <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:#4d4738;">
+              <input type="checkbox" id="inpLojaNova" style="width:auto;" ${STATE.config.lojaNova ? 'checked' : ''}>
+              Loja nova (ainda sem histórico de vendas próprio)
+            </label>
+            <div class="help">Se ativo, a venda média de cada artigo passa a ser calculada a partir das outras lojas: venda média diária da rede ÷ número de lojas que vendem esse artigo. Para isto funcionar, o ficheiro de vendas precisa de ter uma coluna a identificar a loja de cada venda.</div>
+          </div>
+          <div class="field-row">
             <label class="field">Atenuação do reforço por categoria (0 a 1)</label>
             <input type="number" id="inpPeso" min="0" max="1" step="0.05" value="${STATE.config.pesoCategoriaReforco}">
             <div class="help">Quanto mais baixo, mais se reduz o reforço de artigos cuja categoria já está bem servida (evita excesso financeiro). 1 = sem atenuação.</div>
@@ -570,6 +626,7 @@ function renderConfigScreen(root) {
     STATE.config.coberturaObjDias = Number(document.getElementById('inpCobertura').value) || 10;
     STATE.config.janelaVendasDias = Number(document.getElementById('inpJanela').value) || 10;
     STATE.config.pesoCategoriaReforco = Math.min(1, Math.max(0, Number(document.getElementById('inpPeso').value)));
+    STATE.config.lojaNova = document.getElementById('inpLojaNova').checked;
     STATE.storeName = document.getElementById('inpStoreName').value.trim();
     scheduleCloudSave();
     toast('Parâmetros guardados.', 'ok');
@@ -589,12 +646,15 @@ async function connectCloud() {
   if (statusEl) statusEl.innerHTML = `<div class="banner info"><span class="spinner"></span> A ligar à nuvem…</div>`;
   try {
     const record = await cloudRead();
+    STATE.jsonbin.connected = true; // a leitura teve sucesso — a ligação está ok
     if (record && Object.keys(record).length) {
       mergeRemoteState(record);
     } else {
-      await cloudWrite(exportableState());
+      // Bin vazio: grava o estado inicial, mas isto passa pelo mesmo
+      // caminho com retry/fila das gravações normais, e uma falha aqui
+      // não deve impedir gravações futuras.
+      scheduleCloudSave();
     }
-    STATE.jsonbin.connected = true;
     setStoreTag(STATE.storeName || 'na nuvem', 'ok');
     saveLocal();
     if (statusEl) statusEl.innerHTML = `<div class="banner info">Ligado à nuvem. O trabalho é guardado automaticamente.</div>`;
@@ -608,7 +668,10 @@ async function connectCloud() {
         : e.message;
       statusEl.innerHTML = `<div class="banner danger">${escapeHtml(friendly)}</div>`;
     }
-    toast('Sem ligação à nuvem — a trabalhar só neste navegador por agora.', 'err');
+    toast('Sem ligação à nuvem — a trabalhar só neste navegador por agora. A tentar de novo em breve.', 'err');
+    // Tenta voltar a ligar sozinho depois de uma pausa, sem o utilizador
+    // precisar de recarregar a página.
+    setTimeout(connectCloud, 8000);
   }
 }
 
@@ -1045,6 +1108,7 @@ function renderStockTable(container) {
 const VENDAS_FIELDS = [
   { key: 'codigo', label: 'Código do artigo', required: true, type: 'text', guesses: ['Código artigo', 'Codigo', 'Código', 'SKU', 'Artigo'] },
   { key: 'descricao', label: 'Descrição (opcional)', required: false, type: 'text', guesses: ['Descrição', 'Descricao', 'Nome'] },
+  { key: 'loja', label: 'Loja / cluster (opcional)', required: false, type: 'text', guesses: ['Loja', 'Cluster', 'Filial', 'Store'] },
   { key: 'data', label: 'Data da venda', required: true, type: 'date', guesses: ['Data', 'Data Venda', 'Dia'] },
   { key: 'quantidade', label: 'Quantidade vendida', required: true, type: 'number', guesses: ['Quantidade', 'Qtd', 'Vendas', 'Qtd Vendida', 'Unidades'] },
 ];
@@ -1092,10 +1156,11 @@ function renderVendasTable(container) {
     return;
   }
 
-  let mediaPorArtigo, dataLimite, dataMax, janelaLabel;
+  let mediaPorArtigo, dataLimite, dataMax, janelaLabel, nLojasPorArtigo;
   if (items.length) {
-    const calc = calcularVendaMedia(items, STATE.config.janelaVendasDias);
+    const calc = calcularVendaMedia(items, STATE.config.janelaVendasDias, { lojaNova: STATE.config.lojaNova });
     mediaPorArtigo = calc.mediaPorArtigo; dataLimite = calc.dataLimite; dataMax = calc.dataMax;
+    nLojasPorArtigo = calc.nLojasPorArtigo;
     janelaLabel = `${dataLimite.toLocaleDateString('pt-PT')} a ${dataMax.toLocaleDateString('pt-PT')}`;
   } else {
     mediaPorArtigo = STATE.vendas.mediaPorArtigo;
@@ -1107,6 +1172,10 @@ function renderVendasTable(container) {
 
   container.innerHTML = `
     <div class="panel">
+      ${STATE.config.lojaNova ? `
+        <div class="banner info">
+          🏬 <b>Modo loja nova ativo:</b> a venda média de cada artigo é calculada a partir da venda média da rede dividida pelo número de lojas que já vendem esse artigo — não pelo histórico próprio desta loja (que ainda não existe). Pode desligar este modo no passo 0.
+        </div>` : ''}
       ${items.length ? `
         <div class="banner info">
           Janela considerada: <b>${janelaLabel}</b> (${STATE.config.janelaVendasDias} dias). Pode ajustar a janela no passo 0.
@@ -1124,7 +1193,7 @@ function renderVendasTable(container) {
         <div class="search-box">🔎 <input type="text" id="vendasSearch" placeholder="Procurar código…"></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Código</th><th>Descrição</th><th class="num">Venda média/dia (${STATE.config.janelaVendasDias}d)</th><th class="num">Total no período</th></tr></thead>
+        <thead><tr><th>Código</th><th>Descrição</th>${STATE.config.lojaNova ? '<th class="num">Nº lojas com venda</th>' : ''}<th class="num">Venda média/dia (${STATE.config.janelaVendasDias}d)</th><th class="num">Total no período</th></tr></thead>
         <tbody id="vendasTbody"></tbody>
       </table></div>
       <div class="btn-row">
@@ -1144,17 +1213,18 @@ function renderVendasTable(container) {
     const rows = codes.map(k => {
       const cx = cardexByCode[k];
       const desc = cx ? cx.descricao : (items.find(i => normKey(i.codigo) === k)?.descricao || '');
-      return { codigo: cx ? cx.codigo : k, desc, media: mediaPorArtigo[k] };
+      return { codigo: cx ? cx.codigo : k, desc, media: mediaPorArtigo[k], nLojas: nLojasPorArtigo ? nLojasPorArtigo[k] : null };
     }).sort((a, b) => b.media - a.media);
 
     tbody.innerHTML = rows.map(r => `
       <tr>
         <td>${escapeHtml(r.codigo)}</td>
         <td>${escapeHtml(r.desc || '—')}</td>
+        ${STATE.config.lojaNova ? `<td class="num">${r.nLojas ?? '—'}</td>` : ''}
         <td class="num">${fmtNum(r.media, 2)}</td>
         <td class="num">${fmtNum(r.media * STATE.config.janelaVendasDias, 1)}</td>
       </tr>
-    `).join('') || `<tr><td colspan="4" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+    `).join('') || `<tr><td colspan="${STATE.config.lojaNova ? 5 : 4}" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
   }
   container.querySelector('#vendasSearch').addEventListener('input', draw);
   draw();
@@ -1300,7 +1370,7 @@ function renderPedidoScreen(root) {
   document.getElementById('btnBackVendas').addEventListener('click', () => goTo(3));
   document.getElementById('btnRecalc').addEventListener('click', () => {
     if (!confirm('Isto substitui as quantidades editadas pela sugestão original. Continuar?')) return;
-    const { mediaPorArtigo } = calcularVendaMedia(STATE.vendas.items, STATE.config.janelaVendasDias);
+    const { mediaPorArtigo } = calcularVendaMedia(STATE.vendas.items, STATE.config.janelaVendasDias, { lojaNova: STATE.config.lojaNova });
     STATE.pedidoSugerido = gerarPedidoSugerido({
       cardex: STATE.cardex.items, stock: STATE.stock.items, mediaPorArtigo,
       coberturaDias: STATE.config.coberturaObjDias,
