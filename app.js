@@ -441,10 +441,22 @@ function gerarPedidoSugerido({ cardex, stock, mediaPorArtigo, coberturaDias }) {
     const k = normKey(c.codigo);
     const vendaMediaDia = mediaPorArtigo[k] || 0;
     const stockAtual = stockPorArtigo[k] || 0;
-    const necessidade = vendaMediaDia * coberturaDias - stockAtual;
     const conv = c.conversaoCaixas > 0 ? c.conversaoCaixas : 1;
-    const caixasSugeridas = necessidade > 0 ? Math.ceil(necessidade / conv) : 0;
-    const qtdSugerida = caixasSugeridas * conv;
+    const semHistorico = vendaMediaDia === 0;
+    const necessidade = vendaMediaDia * coberturaDias - stockAtual;
+
+    let caixasSugeridas, qtdSugerida;
+    if (semHistorico && stockAtual === 0) {
+      // Artigo nunca vendido (ou sem dados de venda) e sem stock: sugere
+      // sempre 1 caixa, para garantir que a loja passa a ter o artigo
+      // disponível e a gerar o seu próprio histórico de venda.
+      caixasSugeridas = 1;
+      qtdSugerida = conv;
+    } else {
+      caixasSugeridas = necessidade > 0 ? Math.ceil(necessidade / conv) : 0;
+      qtdSugerida = caixasSugeridas * conv;
+    }
+
     return {
       codigo: c.codigo,
       descricao: c.descricao,
@@ -453,6 +465,7 @@ function gerarPedidoSugerido({ cardex, stock, mediaPorArtigo, coberturaDias }) {
       conversaoCaixas: conv,
       vendaMediaDia,
       stockAtual,
+      semHistorico,
       coberturaDiasAtual: vendaMediaDia > 0 ? stockAtual / vendaMediaDia : (stockAtual > 0 ? Infinity : 0),
       necessidadeBruta: necessidade,
       caixasSugeridas,
@@ -1275,7 +1288,7 @@ function renderVendasTable(container) {
         <div class="search-box">🔎 <input type="text" id="vendasSearch" placeholder="Procurar código…"></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Código</th><th>Descrição</th>${STATE.config.lojaNova ? '<th class="num">Nº lojas com venda</th>' : ''}<th class="num">Venda média/dia (${STATE.config.janelaVendasDias}d)</th><th class="num">Total no período</th></tr></thead>
+        <thead><tr><th>Código</th><th>Descrição</th>${STATE.config.lojaNova ? '<th class="num">Nº lojas com venda</th>' : ''}<th class="num">Venda média/dia (un)</th><th class="num">Venda média/dia (cx)</th><th class="num">Total no período (un)</th></tr></thead>
         <tbody id="vendasTbody"></tbody>
       </table></div>
       <div class="btn-row">
@@ -1295,7 +1308,8 @@ function renderVendasTable(container) {
     const rows = codes.map(k => {
       const cx = cardexByCode[k];
       const desc = cx ? cx.descricao : (items.find(i => normKey(i.codigo) === k)?.descricao || '');
-      return { codigo: cx ? cx.codigo : k, desc, media: mediaPorArtigo[k], nLojas: nLojasPorArtigo ? nLojasPorArtigo[k] : null };
+      const conv = cx && cx.conversaoCaixas > 0 ? cx.conversaoCaixas : 1;
+      return { codigo: cx ? cx.codigo : k, desc, media: mediaPorArtigo[k], conv, nLojas: nLojasPorArtigo ? nLojasPorArtigo[k] : null };
     }).sort((a, b) => b.media - a.media);
 
     tbody.innerHTML = rows.map(r => `
@@ -1304,9 +1318,10 @@ function renderVendasTable(container) {
         <td>${escapeHtml(r.desc || '—')}</td>
         ${STATE.config.lojaNova ? `<td class="num">${r.nLojas ?? '—'}</td>` : ''}
         <td class="num">${fmtNum(r.media, 2)}</td>
+        <td class="num">${fmtNum(r.media / r.conv, 3)}</td>
         <td class="num">${fmtNum(r.media * STATE.config.janelaVendasDias, 1)}</td>
       </tr>
-    `).join('') || `<tr><td colspan="${STATE.config.lojaNova ? 5 : 4}" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+    `).join('') || `<tr><td colspan="${STATE.config.lojaNova ? 6 : 5}" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
   }
   container.querySelector('#vendasSearch').addEventListener('input', draw);
   draw();
@@ -1354,8 +1369,8 @@ function renderPedidoScreen(root) {
       <div class="stats">
         <div class="stat"><div class="v">${aPedir.length}</div><div class="l">Artigos com pedido</div></div>
         <div class="stat"><div class="v">${fmtNum(totalUnid)}</div><div class="l">Unidades a pedir</div></div>
-        <div class="stat"><div class="v">${fmtNum(totalCaixas)}</div><div class="l">Caixas a pedir (aprox.)</div></div>
-        <div class="stat"><div class="v">${semCobertura}</div><div class="l">Artigos sem histórico de venda</div></div>
+        <div class="stat"><div class="v">${fmtNum(totalCaixas)}</div><div class="l">Caixas a pedir</div></div>
+        <div class="stat"><div class="v">${semCobertura}</div><div class="l">Artigos sem histórico (1 cx sugerida)</div></div>
       </div>
 
       <div class="toolbar">
@@ -1374,8 +1389,10 @@ function renderPedidoScreen(root) {
       <div class="table-wrap"><table>
         <thead><tr>
           <th>Código</th><th>Descrição</th><th>Categoria</th>
-          <th class="num">Venda média/dia</th><th class="num">Stock atual</th><th class="num">Cobertura atual (dias)</th>
-          <th class="num">Sugestão</th><th class="num">Qtd a pedir</th>
+          <th class="num">Venda média/dia (un)</th><th class="num">Venda média/dia (cx)</th>
+          <th class="num">Stock atual</th><th class="num">Cobertura atual (dias)</th>
+          <th class="num">Sugestão (cx)</th><th class="num">Sugestão (un)</th>
+          <th class="num">Caixas a pedir</th><th class="num">Unidades a pedir</th>
         </tr></thead>
         <tbody id="pedTbody"></tbody>
       </table></div>
@@ -1384,6 +1401,7 @@ function renderPedidoScreen(root) {
         <span><span class="swatch" style="background:var(--danger)"></span> cobertura &lt; 3 dias</span>
         <span><span class="swatch" style="background:var(--warn)"></span> cobertura &lt; ${STATE.config.coberturaObjDias} dias</span>
         <span><span class="swatch" style="background:var(--ok)"></span> cobertura ok</span>
+        <span><span class="swatch" style="background:#9a7bd6"></span> sem histórico — sugestão fixa de 1 caixa</span>
       </div>
 
       <div class="btn-row">
@@ -1419,19 +1437,40 @@ function renderPedidoScreen(root) {
 
   function draw() {
     const rows = rowsFiltered();
-    tbody.innerHTML = rows.map(it => `
-      <tr data-code="${escapeHtml(it.codigo)}">
+    tbody.innerHTML = rows.map(it => {
+      const conv = it.conversaoCaixas || 1;
+      const caixasPedidas = Math.ceil((it.qtdPedida || 0) / conv);
+      return `
+      <tr data-code="${escapeHtml(it.codigo)}" ${it.semHistorico ? 'style="background:#f3eefb;"' : ''}>
         <td>${escapeHtml(it.codigo)}</td>
-        <td>${escapeHtml(it.descricao)}</td>
+        <td>${escapeHtml(it.descricao)} ${it.semHistorico ? '<span class="tag" style="background:#e7defa;color:#6b4fa0;">sem histórico</span>' : ''}</td>
         <td><span class="tag muted">${escapeHtml(it.categoria)}</span></td>
         <td class="num">${fmtNum(it.vendaMediaDia, 2)}</td>
+        <td class="num">${fmtNum(it.vendaMediaDia / conv, 3)}</td>
         <td class="num">${fmtNum(it.stockAtual)}</td>
         <td class="num">${coberturaTag(it)}</td>
+        <td class="num">${fmtNum(it.caixasSugeridas)}</td>
         <td class="num">${fmtNum(it.qtdSugerida)}</td>
-        <td class="num"><input type="number" min="0" step="${it.conversaoCaixas || 1}" class="editable-qty" data-code="${escapeHtml(it.codigo)}" value="${it.qtdPedida}" style="width:90px;text-align:right;padding:4px 6px;"></td>
-      </tr>
-    `).join('') || `<tr><td colspan="8" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+        <td class="num"><input type="number" min="0" step="1" class="editable-cx" data-code="${escapeHtml(it.codigo)}" data-conv="${conv}" value="${caixasPedidas}" style="width:70px;text-align:right;padding:4px 6px;"></td>
+        <td class="num"><input type="number" min="0" step="${conv}" class="editable-qty" data-code="${escapeHtml(it.codigo)}" value="${it.qtdPedida}" style="width:90px;text-align:right;padding:4px 6px;"></td>
+      </tr>`;
+    }).join('') || `<tr><td colspan="11" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
 
+    // Editar pela coluna "Caixas a pedir" recalcula as unidades (caixas × conversão)
+    tbody.querySelectorAll('.editable-cx').forEach(inp => {
+      inp.addEventListener('change', () => {
+        const code = inp.dataset.code;
+        const conv = Number(inp.dataset.conv) || 1;
+        const it = items.find(i => i.codigo === code);
+        const caixas = Math.max(0, Math.round(Number(inp.value) || 0));
+        it.qtdPedida = caixas * conv;
+        inp.value = caixas;
+        const qtyInput = tbody.querySelector(`.editable-qty[data-code="${code}"]`);
+        if (qtyInput) qtyInput.value = it.qtdPedida;
+        scheduleCloudSave('pedido');
+      });
+    });
+    // Editar pela coluna "Unidades a pedir" recalcula as caixas (arredondado para cima)
     tbody.querySelectorAll('.editable-qty').forEach(inp => {
       inp.addEventListener('change', () => {
         const code = inp.dataset.code;
@@ -1439,6 +1478,9 @@ function renderPedidoScreen(root) {
         const v = Math.max(0, Number(inp.value) || 0);
         it.qtdPedida = v;
         inp.value = v;
+        const conv = it.conversaoCaixas || 1;
+        const cxInput = tbody.querySelector(`.editable-cx[data-code="${code}"]`);
+        if (cxInput) cxInput.value = Math.ceil(v / conv);
         scheduleCloudSave('pedido');
       });
     });
@@ -1466,14 +1508,14 @@ function renderPedidoScreen(root) {
   document.getElementById('btnExportXlsx').addEventListener('click', () => {
     const rows = aPedirRows();
     downloadXLSX('pedido_sugerido.xlsx',
-      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Venda média/dia', 'Stock atual', 'Qtd a pedir', 'Caixas a pedir'],
+      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Caixas a pedir', 'Unidades a pedir', 'Venda média/dia', 'Stock atual', 'Sem histórico'],
       rows);
     toast('Exportado pedido_sugerido.xlsx', 'ok');
   });
   document.getElementById('btnExportCsv').addEventListener('click', () => {
     const rows = aPedirRows();
     downloadCSV('pedido_sugerido.csv',
-      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Venda média/dia', 'Stock atual', 'Qtd a pedir', 'Caixas a pedir'],
+      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Caixas a pedir', 'Unidades a pedir', 'Venda média/dia', 'Stock atual', 'Sem histórico'],
       rows);
     toast('Exportado pedido_sugerido.csv', 'ok');
   });
@@ -1481,7 +1523,8 @@ function renderPedidoScreen(root) {
   function aPedirRows() {
     return items.filter(i => i.qtdPedida > 0).map(i => [
       i.codigo, i.descricao, i.categoria, i.unidade || '', i.conversaoCaixas,
-      Number(i.vendaMediaDia.toFixed(2)), i.stockAtual, i.qtdPedida, Math.ceil(i.qtdPedida / (i.conversaoCaixas || 1))
+      Math.ceil(i.qtdPedida / (i.conversaoCaixas || 1)), i.qtdPedida,
+      Number(i.vendaMediaDia.toFixed(2)), i.stockAtual, i.semHistorico ? 'sim' : 'não'
     ]);
   }
 
