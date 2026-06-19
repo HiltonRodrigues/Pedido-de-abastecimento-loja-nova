@@ -7,7 +7,7 @@ const STORAGE_LOCAL_KEY = 'cardex_pedido_local_v1';
 
 const STATE = {
   step: 0,
-  jsonbin: { apiKey: '', binId: '', connected: false },
+  jsonbin: { apiKey: '', binId: '', workerUrl: '', connected: false },
   storeName: '',
   config: {
     coberturaObjDias: 10,
@@ -68,9 +68,29 @@ function loadLocal() {
 // ---------------------------------------------------------------
 // JSONBin.io integration
 // ---------------------------------------------------------------
+// Por padrão a app fala diretamente com o JSONBin. Se o JSONBin bloquear o
+// pedido do navegador por CORS (acontece de forma intermitente em alguns
+// domínios), o utilizador pode preencher STATE.jsonbin.workerUrl com o URL
+// de um Cloudflare Worker (ver instruções no README) que faz a ponte
+// servidor-a-servidor, sem essa restrição.
 const JSONBIN_BASE = 'https://api.jsonbin.io/v3';
 
+function usingWorkerProxy() {
+  return !!(STATE.jsonbin.workerUrl && STATE.jsonbin.workerUrl.trim());
+}
+
 async function jsonbinCreateBin(apiKey, data, name) {
+  if (usingWorkerProxy()) {
+    // O Worker já sabe o BIN_ID e a API_KEY (estão no código dele), por isso
+    // "criar" aqui equivale a gravar o estado inicial nesse bin fixo.
+    const res = await fetch(STATE.jsonbin.workerUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('Falha ao gravar via Worker (' + res.status + ')');
+    return 'worker';
+  }
   const res = await fetch(`${JSONBIN_BASE}/b`, {
     method: 'POST',
     headers: {
@@ -87,6 +107,12 @@ async function jsonbinCreateBin(apiKey, data, name) {
 }
 
 async function jsonbinRead(apiKey, binId) {
+  if (usingWorkerProxy()) {
+    const res = await fetch(STATE.jsonbin.workerUrl, { method: 'GET' });
+    if (!res.ok) throw new Error('Falha ao ler via Worker (' + res.status + ')');
+    const j = await res.json();
+    return j.record || j;
+  }
   const res = await fetch(`${JSONBIN_BASE}/b/${binId}/latest`, {
     headers: { 'X-Master-Key': apiKey }
   });
@@ -115,6 +141,15 @@ function mergeRemoteState(record) {
 }
 
 async function jsonbinWrite(apiKey, binId, data) {
+  if (usingWorkerProxy()) {
+    const res = await fetch(STATE.jsonbin.workerUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('Falha ao gravar via Worker (' + res.status + ')');
+    return res.json();
+  }
   const res = await fetch(`${JSONBIN_BASE}/b/${binId}`, {
     method: 'PUT',
     headers: {
@@ -533,8 +568,16 @@ function renderConfigScreen(root) {
           </div>
           <div class="field-row">
             <label class="field">Bin ID (deixe vazio para criar um novo)</label>
-            <input type="text" id="inpBinId" placeholder="ex: 64f1a2b3c45d6e7f8a9b0c1d" value="${escapeHtml(STATE.jsonbin.binId)}">
+            <input type="text" id="inpBinId" placeholder="ex: 64f1a2b3c45d6e7f8a9b0c1d" value="${escapeHtml(STATE.jsonbin.binId)}" ${usingWorkerProxy() ? 'disabled' : ''}>
           </div>
+          <details style="margin-bottom:14px;">
+            <summary style="cursor:pointer;font-size:12px;font-weight:600;color:#4d4738;">Avançado: usar um Cloudflare Worker (só se o JSONBin der erro 403 por bloqueio de CORS)</summary>
+            <div class="field-row" style="margin-top:10px;">
+              <label class="field">URL do Cloudflare Worker</label>
+              <input type="text" id="inpWorkerUrl" placeholder="https://o-seu-worker.workers.dev" value="${escapeHtml(STATE.jsonbin.workerUrl || '')}">
+              <div class="help">Se preencher isto, a app passa a falar com o JSONBin através do seu Worker em vez de diretamente — resolve bloqueios de CORS. Deixe vazio para o comportamento normal. Ver instruções no README.</div>
+            </div>
+          </details>
           <div class="btn-row">
             <button class="btn accent" id="btnConnect">Ligar / Criar bin</button>
             <button class="btn secondary" id="btnDisconnect" ${STATE.jsonbin.connected ? '' : 'disabled'}>Desligar</button>
@@ -617,36 +660,55 @@ async function onConnectJsonbin() {
   const apiKey = document.getElementById('inpApiKey').value.trim();
   let binId = document.getElementById('inpBinId').value.trim();
   const storeName = document.getElementById('inpStoreName').value.trim();
+  const workerUrl = document.getElementById('inpWorkerUrl').value.trim();
   const statusEl = document.getElementById('connStatus');
+  const viaWorker = !!workerUrl;
 
-  if (!apiKey) { toast('Indique a chave API do JSONBin.', 'err'); return; }
+  if (!viaWorker && !apiKey) { toast('Indique a chave API do JSONBin (ou um URL de Worker no modo avançado).', 'err'); return; }
 
-  statusEl.innerHTML = `<div class="banner info"><span class="spinner"></span> A ligar ao JSONBin…</div>`;
+  STATE.jsonbin.workerUrl = workerUrl;
+
+  statusEl.innerHTML = `<div class="banner info"><span class="spinner"></span> A ligar ${viaWorker ? 'ao Worker' : 'ao JSONBin'}…</div>`;
   try {
-    if (binId) {
+    if (viaWorker) {
+      // No modo Worker o bin é fixo (definido dentro do código do Worker),
+      // por isso lemos sempre o que já lá estiver — se estiver vazio, gravamos o estado atual.
+      try {
+        const record = await jsonbinRead(apiKey, binId);
+        if (record && Object.keys(record).length) mergeRemoteState(record);
+        else await jsonbinWrite(apiKey, binId, exportableState());
+      } catch (e) {
+        await jsonbinWrite(apiKey, binId, exportableState());
+      }
+      binId = binId || 'via-worker';
+    } else if (binId) {
       const record = await jsonbinRead(apiKey, binId);
       mergeRemoteState(record);
     } else {
       binId = await jsonbinCreateBin(apiKey, exportableState(), storeName || 'cardex-pedido');
       toast('Novo bin criado: ' + binId, 'ok');
     }
-    STATE.jsonbin = { apiKey, binId, connected: true };
+    STATE.jsonbin = { apiKey, binId, workerUrl, connected: true };
     STATE.storeName = storeName || STATE.storeName;
-    setStoreTag(STATE.storeName || binId, 'ok');
+    setStoreTag(STATE.storeName || (viaWorker ? 'via Worker' : binId), 'ok');
     saveLocal();
-    statusEl.innerHTML = `<div class="banner info">Ligado ao bin <b>${escapeHtml(binId)}</b>. Guarde este ID para continuar mais tarde noutro dispositivo.</div>`;
+    statusEl.innerHTML = viaWorker
+      ? `<div class="banner info">Ligado através do Worker. Os dados estão a gravar no bin configurado dentro do código do Worker.</div>`
+      : `<div class="banner info">Ligado ao bin <b>${escapeHtml(binId)}</b>. Guarde este ID para continuar mais tarde noutro dispositivo.</div>`;
     render();
   } catch (e) {
     const friendly = /failed to fetch/i.test(e.message)
-      ? 'Não foi possível contactar o JSONBin. Verifique a ligação à internet, se a chave API está correta, e se o domínio api.jsonbin.io não está bloqueado pela rede.'
+      ? (viaWorker
+          ? 'Não foi possível contactar o Worker. Verifique se o URL está correto e se o Worker foi publicado (Deploy) no Cloudflare.'
+          : 'Não foi possível contactar o JSONBin diretamente — isto costuma ser um bloqueio de CORS do lado do JSONBin. Experimente a opção "Avançado: usar um Cloudflare Worker" abaixo do Bin ID.')
       : e.message;
     statusEl.innerHTML = `<div class="banner danger">${escapeHtml(friendly)}</div>`;
-    toast('Não foi possível ligar ao JSONBin.', 'err');
+    toast('Não foi possível ligar.', 'err');
   }
 }
 
 function onDisconnectJsonbin() {
-  STATE.jsonbin = { apiKey: '', binId: '', connected: false };
+  STATE.jsonbin = { apiKey: '', binId: '', workerUrl: '', connected: false };
   setStoreTag('sem ligação a dados');
   saveLocal();
   render();
