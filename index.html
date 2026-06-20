@@ -100,6 +100,13 @@ input:focus,select:focus{outline:2px solid var(--accent);outline-offset:1px;}
 .table-wrap{border:1px solid var(--line);border-radius:var(--radius);overflow:auto;max-height:560px;}
 table{width:100%;border-collapse:collapse;font-size:12.5px;}
 thead th{position:sticky;top:0;background:var(--ink);color:#fff;text-align:left;padding:8px 10px;font-weight:600;white-space:nowrap;z-index:2;}
+thead th[data-sort]{cursor:pointer;user-select:none;}
+thead th[data-sort]:hover{background:#2d3a35;}
+thead th[data-sort]::after{content:'';display:inline-block;width:0;height:0;margin-left:5px;vertical-align:middle;opacity:.5;}
+thead th[data-sort].sort-asc::after{content:'▲';font-size:9px;opacity:1;}
+thead th[data-sort].sort-desc::after{content:'▼';font-size:9px;opacity:1;}
+tfoot td{padding:9px 10px;border-top:2px solid var(--ink);font-weight:700;background:#fbfaf6;position:sticky;bottom:0;}
+tfoot td.num{font-family:var(--mono);}
 thead th.num,td.num{text-align:right;}
 tbody td{padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap;}
 tbody tr:nth-child(even){background:#fbfaf6;}
