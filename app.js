@@ -339,6 +339,50 @@ function toNum(v) {
 function normKey(s) {
   return String(s || '').trim().toUpperCase().replace(/\s+/g, ' ');
 }
+// ---------------------------------------------------------------
+// Ordenação de tabelas por coluna (clique no cabeçalho)
+// ---------------------------------------------------------------
+// sortState guarda, por tabela (chave arbitrária), a coluna e direção atuais.
+const sortState = {};
+
+function attachSortableHeaders(theadEl, tableKey, getter, onSortChange) {
+  if (!sortState[tableKey]) sortState[tableKey] = { col: null, dir: null };
+  theadEl.querySelectorAll('th[data-sort]').forEach(th => {
+    const col = th.dataset.sort;
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (sortState[tableKey].col === col) {
+      th.classList.add(sortState[tableKey].dir === 'asc' ? 'sort-asc' : 'sort-desc');
+    }
+    th.onclick = () => {
+      const st = sortState[tableKey];
+      if (st.col === col) {
+        st.dir = st.dir === 'desc' ? 'asc' : (st.dir === 'asc' ? null : 'desc');
+        if (st.dir === null) st.col = null;
+      } else {
+        st.col = col; st.dir = 'desc'; // primeiro clique: maior → menor
+      }
+      onSortChange();
+    };
+  });
+}
+
+function applySorting(rows, tableKey, getter) {
+  const st = sortState[tableKey];
+  if (!st || !st.col || !st.dir) return rows;
+  const sorted = [...rows].sort((a, b) => {
+    let va = getter(a, st.col), vb = getter(b, st.col);
+    if (typeof va === 'string' || typeof vb === 'string') {
+      va = String(va ?? '').toLowerCase(); vb = String(vb ?? '').toLowerCase();
+      return va < vb ? -1 : va > vb ? 1 : 0;
+    }
+    va = Number.isFinite(va) ? va : -Infinity;
+    vb = Number.isFinite(vb) ? vb : -Infinity;
+    return va - vb;
+  });
+  if (st.dir === 'desc') sorted.reverse();
+  return sorted;
+}
+
 function fmtNum(n, dec = 0) {
   if (n === null || n === undefined || isNaN(n)) return '—';
   return Number(n).toLocaleString('pt-PT', { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -1043,9 +1087,10 @@ function renderCardexTable(container) {
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Código</th><th>Descrição</th><th>Categoria (editável)</th><th>Unidade</th><th class="num">Unid/Caixa</th>
+          <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Categoria (editável)</th><th data-sort="unidade">Unidade</th><th class="num" data-sort="conversaoCaixas">Unid/Caixa</th>
         </tr></thead>
         <tbody id="cardexTbody"></tbody>
+        <tfoot id="cardexTfoot"></tfoot>
       </table></div>
     </div>
   `;
@@ -1053,10 +1098,11 @@ function renderCardexTable(container) {
   function draw() {
     const q = normKey(document.getElementById('cardexSearch').value);
     const cat = document.getElementById('cardexCatFilter').value;
-    const rows = items.filter(it =>
+    let rows = items.filter(it =>
       (!q || normKey(it.codigo).includes(q) || normKey(it.descricao).includes(q)) &&
       (!cat || it.categoria === cat)
     );
+    rows = applySorting(rows, 'cardex', (it, col) => it[col]);
     tbody.innerHTML = rows.map(it => `
       <tr data-code="${escapeHtml(it.codigo)}">
         <td>${escapeHtml(it.codigo)}</td>
@@ -1066,6 +1112,11 @@ function renderCardexTable(container) {
         <td class="num">${fmtNum(it.conversaoCaixas)}</td>
       </tr>
     `).join('') || `<tr><td colspan="5" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+
+    container.querySelector('#cardexTfoot').innerHTML = rows.length ? `
+      <tr><td colspan="4">Total (${rows.length} artigo${rows.length === 1 ? '' : 's'})</td><td class="num">—</td></tr>` : '';
+
+    attachSortableHeaders(container.querySelector('thead'), 'cardex', null, draw);
 
     tbody.querySelectorAll('.cat-edit').forEach(el => {
       el.addEventListener('blur', () => {
@@ -1172,15 +1223,17 @@ function renderStockTable(container) {
         <div class="stat"><div class="v">${fmtNum(totalUnid)}</div><div class="l">Unidades totais</div></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Código</th><th>Descrição</th><th class="num">Quantidade</th><th>No Cardex?</th></tr></thead>
+        <thead><tr><th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th class="num" data-sort="quantidade">Quantidade</th><th>No Cardex?</th></tr></thead>
         <tbody id="stockTbody"></tbody>
+        <tfoot id="stockTfoot"></tfoot>
       </table></div>
     </div>
   `;
   const tbody = container.querySelector('#stockTbody');
   function draw() {
     const q = normKey(document.getElementById('stockSearch').value);
-    const rows = items.filter(it => !q || normKey(it.codigo).includes(q) || normKey(it.descricao).includes(q));
+    let rows = items.filter(it => !q || normKey(it.codigo).includes(q) || normKey(it.descricao).includes(q));
+    rows = applySorting(rows, 'stock', (it, col) => it[col]);
     tbody.innerHTML = rows.map(it => {
       const inCardex = cardexCodes.has(normKey(it.codigo));
       return `<tr>
@@ -1190,6 +1243,12 @@ function renderStockTable(container) {
         <td>${inCardex ? '<span class="tag ok">sim</span>' : '<span class="tag warn">não</span>'}</td>
       </tr>`;
     }).join('') || `<tr><td colspan="4" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+
+    const totQtd = rows.reduce((s, i) => s + i.quantidade, 0);
+    container.querySelector('#stockTfoot').innerHTML = rows.length ? `
+      <tr><td colspan="2">Total (${rows.length} linha${rows.length === 1 ? '' : 's'})</td><td class="num">${fmtNum(totQtd)}</td><td></td></tr>` : '';
+
+    attachSortableHeaders(container.querySelector('thead'), 'stock', null, draw);
   }
   container.querySelector('#stockSearch').addEventListener('input', draw);
   draw();
@@ -1294,8 +1353,9 @@ function renderVendasTable(container) {
         <div class="search-box">🔎 <input type="text" id="vendasSearch" placeholder="Procurar código…"></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Código</th><th>Descrição</th>${STATE.config.lojaNova ? '<th class="num">Total lojas da rede</th>' : ''}<th class="num">Venda média/dia (un)</th><th class="num">Venda média/dia (cx)</th><th class="num">Total no período (un)</th></tr></thead>
+        <thead><tr><th data-sort="codigo">Código</th><th data-sort="desc">Descrição</th>${STATE.config.lojaNova ? '<th class="num" data-sort="nLojas">Total lojas da rede</th>' : ''}<th class="num" data-sort="media">Venda média/dia (un)</th><th class="num" data-sort="mediaCx">Venda média/dia (cx)</th><th class="num" data-sort="totalPeriodo">Total no período (un)</th></tr></thead>
         <tbody id="vendasTbody"></tbody>
+        <tfoot id="vendasTfoot"></tfoot>
       </table></div>
       <div class="btn-row">
         <button class="btn secondary" id="btnBackStock">← Stock</button>
@@ -1311,12 +1371,23 @@ function renderVendasTable(container) {
   function draw() {
     const q = normKey(document.getElementById('vendasSearch').value);
     const codes = Object.keys(mediaPorArtigo).filter(k => !q || k.includes(q));
-    const rows = codes.map(k => {
+    let rows = codes.map(k => {
       const cx = cardexByCode[k];
       const desc = cx ? cx.descricao : (items.find(i => normKey(i.codigo) === k)?.descricao || '');
       const conv = cx && cx.conversaoCaixas > 0 ? cx.conversaoCaixas : 1;
       return { codigo: cx ? cx.codigo : k, desc, media: mediaPorArtigo[k], conv, nLojas: nLojasPorArtigo ? nLojasPorArtigo[k] : null };
-    }).sort((a, b) => b.media - a.media);
+    });
+    if (!sortState.vendas || !sortState.vendas.col) {
+      rows.sort((a, b) => b.media - a.media);
+    } else {
+      rows = applySorting(rows, 'vendas', (r, col) => {
+        switch (col) {
+          case 'mediaCx': return r.media / r.conv;
+          case 'totalPeriodo': return r.media * STATE.config.janelaVendasDias;
+          default: return r[col];
+        }
+      });
+    }
 
     tbody.innerHTML = rows.map(r => `
       <tr>
@@ -1328,6 +1399,17 @@ function renderVendasTable(container) {
         <td class="num">${fmtNum(r.media * STATE.config.janelaVendasDias, 1)}</td>
       </tr>
     `).join('') || `<tr><td colspan="${STATE.config.lojaNova ? 6 : 5}" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+
+    const totMedia = rows.reduce((s, r) => s + r.media, 0);
+    const totPeriodo = rows.reduce((s, r) => s + r.media * STATE.config.janelaVendasDias, 0);
+    container.querySelector('#vendasTfoot').innerHTML = rows.length ? `
+      <tr>
+        <td colspan="2">Total (${rows.length} artigo${rows.length === 1 ? '' : 's'})</td>
+        ${STATE.config.lojaNova ? '<td class="num">—</td>' : ''}
+        <td class="num">${fmtNum(totMedia, 2)}</td><td class="num">—</td><td class="num">${fmtNum(totPeriodo, 1)}</td>
+      </tr>` : '';
+
+    attachSortableHeaders(container.querySelector('thead'), 'vendas', null, draw);
   }
   container.querySelector('#vendasSearch').addEventListener('input', draw);
   draw();
@@ -1394,13 +1476,14 @@ function renderPedidoScreen(root) {
 
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Código</th><th>Descrição</th><th>Categoria</th>
-          <th class="num">Venda média/dia (un)</th><th class="num">Venda média/dia (cx)</th>
-          <th class="num">Stock atual</th><th class="num">Cobertura atual (dias)</th>
-          <th class="num">Sugestão (cx)</th><th class="num">Sugestão (un)</th>
-          <th class="num">Caixas a pedir</th><th class="num">Unidades a pedir</th>
+          <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Categoria</th>
+          <th class="num" data-sort="vendaMediaDia">Venda média/dia (un)</th><th class="num" data-sort="vendaMediaDiaCx">Venda média/dia (cx)</th>
+          <th class="num" data-sort="stockAtual">Stock atual</th><th class="num" data-sort="coberturaDiasAtual">Cobertura atual (dias)</th>
+          <th class="num" data-sort="caixasSugeridas">Sugestão (cx)</th><th class="num" data-sort="qtdSugerida">Sugestão (un)</th>
+          <th class="num" data-sort="caixasPedidas">Caixas a pedir</th><th class="num" data-sort="qtdPedida">Unidades a pedir</th>
         </tr></thead>
         <tbody id="pedTbody"></tbody>
+        <tfoot id="pedTfoot"></tfoot>
       </table></div>
 
       <div class="legend">
@@ -1442,7 +1525,14 @@ function renderPedidoScreen(root) {
   }
 
   function draw() {
-    const rows = rowsFiltered();
+    let rows = rowsFiltered();
+    rows = applySorting(rows, 'pedido', (it, col) => {
+      switch (col) {
+        case 'vendaMediaDiaCx': return it.vendaMediaDia / (it.conversaoCaixas || 1);
+        case 'caixasPedidas': return Math.ceil((it.qtdPedida || 0) / (it.conversaoCaixas || 1));
+        default: return it[col];
+      }
+    });
     tbody.innerHTML = rows.map(it => {
       const conv = it.conversaoCaixas || 1;
       const caixasPedidas = Math.ceil((it.qtdPedida || 0) / conv);
@@ -1462,6 +1552,22 @@ function renderPedidoScreen(root) {
       </tr>`;
     }).join('') || `<tr><td colspan="11" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
 
+    const totCaixas = rows.reduce((s, i) => s + Math.ceil((i.qtdPedida || 0) / (i.conversaoCaixas || 1)), 0);
+    const totUnid = rows.reduce((s, i) => s + (i.qtdPedida || 0), 0);
+    const totSugCx = rows.reduce((s, i) => s + i.caixasSugeridas, 0);
+    const totSugUn = rows.reduce((s, i) => s + i.qtdSugerida, 0);
+    const totStock = rows.reduce((s, i) => s + i.stockAtual, 0);
+    root.querySelector('#pedTfoot').innerHTML = rows.length ? `
+      <tr>
+        <td colspan="3">Total (${rows.length} artigo${rows.length === 1 ? '' : 's'})</td>
+        <td class="num">—</td><td class="num">—</td>
+        <td class="num">${fmtNum(totStock)}</td><td class="num">—</td>
+        <td class="num">${fmtNum(totSugCx)}</td><td class="num">${fmtNum(totSugUn)}</td>
+        <td class="num">${fmtNum(totCaixas)}</td><td class="num">${fmtNum(totUnid)}</td>
+      </tr>` : '';
+
+    attachSortableHeaders(root.querySelector('thead'), 'pedido', null, draw);
+
     // Editar pela coluna "Caixas a pedir" recalcula as unidades (caixas × conversão)
     tbody.querySelectorAll('.editable-cx').forEach(inp => {
       inp.addEventListener('change', () => {
@@ -1474,6 +1580,7 @@ function renderPedidoScreen(root) {
         const qtyInput = tbody.querySelector(`.editable-qty[data-code="${code}"]`);
         if (qtyInput) qtyInput.value = it.qtdPedida;
         scheduleCloudSave('pedido');
+        draw();
       });
     });
     // Editar pela coluna "Unidades a pedir" recalcula as caixas (arredondado para cima)
@@ -1488,6 +1595,7 @@ function renderPedidoScreen(root) {
         const cxInput = tbody.querySelector(`.editable-cx[data-code="${code}"]`);
         if (cxInput) cxInput.value = Math.ceil(v / conv);
         scheduleCloudSave('pedido');
+        draw();
       });
     });
   }
@@ -1620,10 +1728,11 @@ function renderServicoTable(container) {
       </div>
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Código</th><th>Descrição</th><th>Categoria</th>
-          <th class="num">Pedido</th><th class="num">Servido</th><th class="num">Nível</th><th class="num">Falta</th>
+          <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Categoria</th>
+          <th class="num" data-sort="qtdPedida">Pedido</th><th class="num" data-sort="qtdServida">Servido</th><th class="num" data-sort="nivelServico">Nível</th><th class="num" data-sort="faltaEntregar">Falta</th>
         </tr></thead>
         <tbody id="svTbody"></tbody>
+        <tfoot id="svTfoot"></tfoot>
       </table></div>
       <div class="btn-row">
         <button class="btn secondary" id="btnBackPedido">← Pedido</button>
@@ -1642,9 +1751,12 @@ function renderServicoTable(container) {
   function draw() {
     const q = normKey(document.getElementById('svSearch').value);
     const cat = document.getElementById('svCatFilter').value;
-    const rows = items
-      .filter(it => (!q || normKey(it.codigo).includes(q) || normKey(it.descricao).includes(q)) && (!cat || it.categoria === cat))
-      .sort((a, b) => b.faltaEntregar - a.faltaEntregar);
+    let rows = items.filter(it => (!q || normKey(it.codigo).includes(q) || normKey(it.descricao).includes(q)) && (!cat || it.categoria === cat));
+    if (!sortState.servico || !sortState.servico.col) {
+      rows = [...rows].sort((a, b) => b.faltaEntregar - a.faltaEntregar);
+    } else {
+      rows = applySorting(rows, 'servico', (it, col) => it[col]);
+    }
     tbody.innerHTML = rows.map(it => `
       <tr>
         <td>${escapeHtml(it.codigo)}</td>
@@ -1656,6 +1768,18 @@ function renderServicoTable(container) {
         <td class="num">${it.faltaEntregar > 0 ? fmtNum(it.faltaEntregar) : '—'}</td>
       </tr>
     `).join('') || `<tr><td colspan="7" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+
+    const totPedido = rows.reduce((s, i) => s + i.qtdPedida, 0);
+    const totServido = rows.reduce((s, i) => s + i.qtdServida, 0);
+    const totFalta = rows.reduce((s, i) => s + i.faltaEntregar, 0);
+    container.querySelector('#svTfoot').innerHTML = rows.length ? `
+      <tr>
+        <td colspan="3">Total (${rows.length} artigo${rows.length === 1 ? '' : 's'})</td>
+        <td class="num">${fmtNum(totPedido)}</td><td class="num">${fmtNum(totServido)}</td>
+        <td class="num">—</td><td class="num">${fmtNum(totFalta)}</td>
+      </tr>` : '';
+
+    attachSortableHeaders(container.querySelector('thead'), 'servico', null, draw);
   }
   container.querySelector('#svSearch').addEventListener('input', draw);
   container.querySelector('#svCatFilter').addEventListener('change', draw);
@@ -1716,12 +1840,13 @@ function renderReforcoScreen(root) {
 
       <div class="table-wrap"><table>
         <thead><tr>
-          <th>Código</th><th>Descrição</th><th>Categoria</th>
-          <th class="num">Pedido orig.</th><th class="num">Servido</th><th class="num">Falta</th>
-          <th class="num">Nível médio categoria</th><th class="num">Atenuação</th>
-          <th>Prioridade</th><th class="num">Reforço sugerido</th><th class="num">Reforço final</th>
+          <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Categoria</th>
+          <th class="num" data-sort="qtdPedidaOriginal">Pedido orig.</th><th class="num" data-sort="qtdServida">Servido</th><th class="num" data-sort="faltaEntregar">Falta</th>
+          <th class="num" data-sort="nivelMedioCategoria">Nível médio categoria</th><th class="num" data-sort="fatorAtenuacao">Atenuação</th>
+          <th data-sort="prioridade">Prioridade</th><th class="num" data-sort="qtdReforcoSugerida">Reforço sugerido</th><th class="num" data-sort="qtdReforco">Reforço final</th>
         </tr></thead>
         <tbody id="rfTbody"></tbody>
+        <tfoot id="rfTfoot"></tfoot>
       </table></div>
 
       <div class="legend">
@@ -1749,10 +1874,15 @@ function renderReforcoScreen(root) {
   function draw() {
     const q = normKey(document.getElementById('rfSearch').value);
     const cat = document.getElementById('rfCatFilter').value;
-    const rows = items.filter(it =>
+    let rows = items.filter(it =>
       (!q || normKey(it.codigo).includes(q) || normKey(it.descricao).includes(q)) &&
       (!cat || it.categoria === cat)
     );
+    if (!sortState.reforco || !sortState.reforco.col) {
+      rows = [...rows].sort((a, b) => b.faltaEntregar - a.faltaEntregar);
+    } else {
+      rows = applySorting(rows, 'reforco', (it, col) => it[col]);
+    }
     tbody.innerHTML = rows.map(it => `
       <tr data-code="${escapeHtml(it.codigo)}">
         <td>${escapeHtml(it.codigo)}</td>
@@ -1769,12 +1899,28 @@ function renderReforcoScreen(root) {
       </tr>
     `).join('') || `<tr><td colspan="11" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
 
+    const totPedOrig = rows.reduce((s, i) => s + i.qtdPedidaOriginal, 0);
+    const totServido = rows.reduce((s, i) => s + i.qtdServida, 0);
+    const totFalta = rows.reduce((s, i) => s + i.faltaEntregar, 0);
+    const totSug = rows.reduce((s, i) => s + i.qtdReforcoSugerida, 0);
+    const totFinal = rows.reduce((s, i) => s + i.qtdReforco, 0);
+    root.querySelector('#rfTfoot').innerHTML = rows.length ? `
+      <tr>
+        <td colspan="3">Total (${rows.length} artigo${rows.length === 1 ? '' : 's'})</td>
+        <td class="num">${fmtNum(totPedOrig)}</td><td class="num">${fmtNum(totServido)}</td><td class="num">${fmtNum(totFalta)}</td>
+        <td class="num">—</td><td class="num">—</td><td>—</td>
+        <td class="num">${fmtNum(totSug)}</td><td class="num">${fmtNum(totFinal)}</td>
+      </tr>` : '';
+
+    attachSortableHeaders(root.querySelector('thead'), 'reforco', null, draw);
+
     tbody.querySelectorAll('.editable-reforco').forEach(inp => {
       inp.addEventListener('change', () => {
         const it = items.find(i => i.codigo === inp.dataset.code);
         it.qtdReforco = Math.max(0, Number(inp.value) || 0);
         inp.value = it.qtdReforco;
         scheduleCloudSave('reforco');
+        draw();
       });
     });
   }
