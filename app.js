@@ -715,7 +715,7 @@ function renderConfigScreen(root) {
           <div class="field-row">
             <label class="field">Cobertura objetivo (dias)</label>
             <input type="number" id="inpCobertura" min="1" step="1" value="${STATE.config.coberturaObjDias}">
-            <div class="help">Dias de stock que o pedido deve garantir: pedido = venda média diária × cobertura − stock atual.</div>
+            <div class="help">Dias de stock que o pedido deve garantir: pedido = venda média diária × cobertura − stock CD.</div>
           </div>
           <div class="field-row">
             <label class="field">Janela de vendas para a média (dias)</label>
@@ -750,7 +750,7 @@ function renderConfigScreen(root) {
       </div>
       <ol style="margin:0;padding-left:20px;font-size:13px;color:#4d4738;line-height:1.8;">
         <li><b>Cardex</b> — carregue a lista de artigos disponíveis para encomenda (define o universo de artigos elegíveis).</li>
-        <li><b>Stock</b> — carregue o stock atual por artigo.</li>
+        <li><b>Stock CD</b> — carregue o stock disponível no Centro de Distribuição por artigo (no primeiro pedido de uma loja nova, ainda não há stock em loja).</li>
         <li><b>Vendas</b> — carregue o histórico de vendas; a app calcula a venda média diária na janela configurada (10 dias por defeito) e sugere a quantidade a pedir por artigo.</li>
         <li><b>Pedido sugerido</b> — reveja, ajuste e exporte o pedido final.</li>
         <li><b>Nível de serviço</b> — carregue o que foi efetivamente servido face ao pedido. A app calcula a % de serviço por artigo.</li>
@@ -765,7 +765,7 @@ function renderConfigScreen(root) {
         <button class="btn danger small" id="btnResetAll">Repor tudo (apaga este ciclo)</button>
       </div>
       <div class="kv"><span>Cardex</span><b>${STATE.cardex.items.length} artigos</b></div>
-      <div class="kv"><span>Stock</span><b>${STATE.stock.items.length} linhas</b></div>
+      <div class="kv"><span>Stock CD</span><b>${STATE.stock.items.length} linhas</b></div>
       <div class="kv"><span>Vendas</span><b>${STATE.vendas.items.length ? STATE.vendas.items.length + ' linhas' : Object.keys(STATE.vendas.mediaPorArtigo || {}).length + ' artigos (só agregado)'}</b></div>
       <div class="kv"><span>Pedido aprovado</span><b>${STATE.pedidoFinal.length} artigos</b></div>
       <div class="kv"><span>Nível de serviço</span><b>${STATE.nivelServico.items.length} artigos</b></div>
@@ -1166,13 +1166,13 @@ function renderCardexTable(container) {
   });
 }
 /* ============================================================
-   ECRÃ 2 — Stock atual
+   ECRÃ 2 — Stock CD
    ============================================================ */
 
 const STOCK_FIELDS = [
   { key: 'codigo', label: 'Código do artigo', required: true, type: 'text', guesses: ['Código artigo', 'Codigo', 'Código', 'SKU', 'Artigo'] },
   { key: 'descricao', label: 'Descrição (opcional)', required: false, type: 'text', guesses: ['Descrição', 'Descricao', 'Nome'] },
-  { key: 'quantidade', label: 'Quantidade em stock', required: true, type: 'number', guesses: ['Stock', 'Quantidade', 'Qtd', 'Stock Atual', 'Existências', 'Existencias'] },
+  { key: 'quantidade', label: 'Quantidade em stock (CD)', required: true, type: 'number', guesses: ['Stock', 'Quantidade', 'Qtd', 'Stock Atual', 'Existências', 'Existencias'] },
 ];
 
 function renderStockScreen(root) {
@@ -1181,8 +1181,8 @@ function renderStockScreen(root) {
       <div class="panel-head">
         <div>
           <span class="eyebrow">Passo 2</span>
-          <h2>Stock atual</h2>
-          <p>Carregue o ficheiro de stock por artigo. Será usado para calcular quanto falta pedir face à venda média e à cobertura objetivo.</p>
+          <h2>Stock CD</h2>
+          <p>Carregue o ficheiro de stock do Centro de Distribuição (CD) por artigo. Será usado para calcular quanto falta pedir face à venda média e à cobertura objetivo. Numa loja nova, o stock em loja é sempre 0 até este primeiro pedido ser servido.</p>
         </div>
       </div>
       <div id="stockUploadWrap"></div>
@@ -1229,7 +1229,7 @@ function renderStockTable(container) {
         <div class="stat"><div class="v">${fmtNum(totalUnid)}</div><div class="l">Unidades totais</div></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th class="num" data-sort="quantidade">Quantidade</th><th>No Cardex?</th></tr></thead>
+        <thead><tr><th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th class="num" data-sort="quantidade">Stock CD</th><th>No Cardex?</th></tr></thead>
         <tbody id="stockTbody"></tbody>
         <tfoot id="stockTfoot"></tfoot>
       </table></div>
@@ -1456,7 +1456,7 @@ function renderPedidoScreen(root) {
         <div>
           <span class="eyebrow">Passo 4</span>
           <h2>Pedido sugerido</h2>
-          <p>Pedido = venda média diária × ${STATE.config.coberturaObjDias} dias de cobertura − stock atual, arredondado para a unidade de caixa. Pode editar a coluna <b>Qtd a pedir</b> diretamente na tabela antes de aprovar.</p>
+          <p>Pedido = venda média diária × ${STATE.config.coberturaObjDias} dias de cobertura − stock CD, arredondado para a unidade de caixa. Pode editar a coluna <b>Qtd a pedir</b> diretamente na tabela antes de aprovar.</p>
         </div>
       </div>
 
@@ -1484,7 +1484,7 @@ function renderPedidoScreen(root) {
         <thead><tr>
           <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Cat.</th>
           <th class="num" data-sort="vendaMediaDia">Venda/dia</th>
-          <th class="num" data-sort="stockAtual">Stock</th><th class="num" data-sort="coberturaDiasAtual">Cobertura (d)</th>
+          <th class="num" data-sort="stockAtual">Stock CD</th><th class="num" data-sort="coberturaDiasAtual">Cobertura (d)</th>
           <th class="num" data-sort="caixasSugeridas">Sugestão</th>
           <th class="num" data-sort="qtdPedida">A pedir</th>
         </tr></thead>
@@ -1624,14 +1624,14 @@ function renderPedidoScreen(root) {
   document.getElementById('btnExportXlsx').addEventListener('click', () => {
     const rows = aPedirRows();
     downloadXLSX('pedido_sugerido.xlsx',
-      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Caixas a pedir', 'Unidades a pedir', 'Venda média/dia', 'Stock atual', 'Sem histórico'],
+      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Caixas a pedir', 'Unidades a pedir', 'Venda média/dia', 'Stock CD', 'Sem histórico'],
       rows);
     toast('Exportado pedido_sugerido.xlsx', 'ok');
   });
   document.getElementById('btnExportCsv').addEventListener('click', () => {
     const rows = aPedirRows();
     downloadCSV('pedido_sugerido.csv',
-      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Caixas a pedir', 'Unidades a pedir', 'Venda média/dia', 'Stock atual', 'Sem histórico'],
+      ['Código', 'Descrição', 'Categoria', 'Unidade', 'Unid/Caixa', 'Caixas a pedir', 'Unidades a pedir', 'Venda média/dia', 'Stock CD', 'Sem histórico'],
       rows);
     toast('Exportado pedido_sugerido.csv', 'ok');
   });
