@@ -497,14 +497,20 @@ function gerarPedidoSugerido({ cardex, stock, mediaPorArtigo, coberturaDias }) {
     let caixasSugeridas, qtdSugerida;
     if (semHistorico) {
       // Artigo do Cardex nunca vendido (ou sem dados de venda na janela):
-      // sugere sempre 1 caixa, independentemente do stock atual, para
-      // garantir que a loja passa a ter o artigo disponível e a gerar o
-      // seu próprio histórico de venda.
+      // sugere sempre 1 caixa, independentemente do stock atual.
       caixasSugeridas = 1;
       qtdSugerida = conv;
     } else {
       caixasSugeridas = necessidade > 0 ? Math.ceil(necessidade / conv) : 0;
       qtdSugerida = caixasSugeridas * conv;
+      // Mínimo absoluto: todo artigo presente no Cardex recebe sempre pelo
+      // menos 1 caixa de sugestão, mesmo quando o cálculo (venda baixa +
+      // stock alto) resultaria em 0 — para garantir presença contínua do
+      // artigo na loja.
+      if (caixasSugeridas === 0) {
+        caixasSugeridas = 1;
+        qtdSugerida = conv;
+      }
     }
 
     return {
@@ -1476,18 +1482,17 @@ function renderPedidoScreen(root) {
 
       <div class="table-wrap"><table>
         <thead><tr>
-          <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Categoria</th>
-          <th class="num" data-sort="vendaMediaDia">Venda média/dia (un)</th><th class="num" data-sort="vendaMediaDiaCx">Venda média/dia (cx)</th>
-          <th class="num" data-sort="stockAtual">Stock atual</th><th class="num" data-sort="coberturaDiasAtual">Cobertura atual (dias)</th>
-          <th class="num" data-sort="caixasSugeridas">Sugestão (cx)</th><th class="num" data-sort="qtdSugerida">Sugestão (un)</th>
-          <th class="num" data-sort="caixasPedidas">Caixas a pedir</th><th class="num" data-sort="qtdPedida">Unidades a pedir</th>
+          <th data-sort="codigo">Código</th><th data-sort="descricao">Descrição</th><th data-sort="categoria">Cat.</th>
+          <th class="num" data-sort="vendaMediaDia">Venda/dia</th>
+          <th class="num" data-sort="stockAtual">Stock</th><th class="num" data-sort="coberturaDiasAtual">Cobertura (d)</th>
+          <th class="num" data-sort="caixasSugeridas">Sugestão</th>
+          <th class="num" data-sort="qtdPedida">A pedir</th>
         </tr></thead>
         <tbody id="pedTbody"></tbody>
         <tfoot id="pedTfoot"></tfoot>
       </table></div>
 
-      <div class="legend">
-        <span><span class="swatch" style="background:var(--danger)"></span> cobertura &lt; 3 dias</span>
+      <div class="legend">        <span><span class="swatch" style="background:var(--danger)"></span> cobertura &lt; 3 dias</span>
         <span><span class="swatch" style="background:var(--warn)"></span> cobertura &lt; ${STATE.config.coberturaObjDias} dias</span>
         <span><span class="swatch" style="background:var(--ok)"></span> cobertura ok</span>
         <span><span class="swatch" style="background:#9a7bd6"></span> sem histórico — sugestão fixa de 1 caixa</span>
@@ -1526,13 +1531,7 @@ function renderPedidoScreen(root) {
 
   function draw() {
     let rows = rowsFiltered();
-    rows = applySorting(rows, 'pedido', (it, col) => {
-      switch (col) {
-        case 'vendaMediaDiaCx': return it.vendaMediaDia / (it.conversaoCaixas || 1);
-        case 'caixasPedidas': return Math.ceil((it.qtdPedida || 0) / (it.conversaoCaixas || 1));
-        default: return it[col];
-      }
-    });
+    rows = applySorting(rows, 'pedido', (it, col) => it[col]);
     tbody.innerHTML = rows.map(it => {
       const conv = it.conversaoCaixas || 1;
       const caixasPedidas = Math.ceil((it.qtdPedida || 0) / conv);
@@ -1541,34 +1540,37 @@ function renderPedidoScreen(root) {
         <td>${escapeHtml(it.codigo)}</td>
         <td>${escapeHtml(it.descricao)} ${it.semHistorico ? '<span class="tag" style="background:#e7defa;color:#6b4fa0;">sem histórico</span>' : ''}</td>
         <td><span class="tag muted">${escapeHtml(it.categoria)}</span></td>
-        <td class="num">${fmtNum(it.vendaMediaDia, 2)}</td>
-        <td class="num">${fmtNum(it.vendaMediaDia / conv, 3)}</td>
+        <td class="num">${fmtNum(it.vendaMediaDia, 2)}<span style="color:#8a8374;font-size:10.5px;"> un</span><br><span style="color:#8a8374;font-size:11px;">${fmtNum(it.vendaMediaDia / conv, 3)} cx</span></td>
         <td class="num">${fmtNum(it.stockAtual)}</td>
         <td class="num">${coberturaTag(it)}</td>
-        <td class="num">${fmtNum(it.caixasSugeridas)}</td>
-        <td class="num">${fmtNum(it.qtdSugerida)}</td>
-        <td class="num"><input type="number" min="0" step="1" class="editable-cx" data-code="${escapeHtml(it.codigo)}" data-conv="${conv}" value="${caixasPedidas}" style="width:70px;text-align:right;padding:4px 6px;"></td>
-        <td class="num"><input type="number" min="0" step="${conv}" class="editable-qty" data-code="${escapeHtml(it.codigo)}" value="${it.qtdPedida}" style="width:90px;text-align:right;padding:4px 6px;"></td>
+        <td class="num">${fmtNum(it.caixasSugeridas)} cx<br><span style="color:#8a8374;font-size:11px;">${fmtNum(it.qtdSugerida)} un</span></td>
+        <td class="num">
+          <div style="display:flex;gap:3px;justify-content:flex-end;align-items:center;">
+            <input type="number" min="0" step="1" class="editable-cx" data-code="${escapeHtml(it.codigo)}" data-conv="${conv}" value="${caixasPedidas}" title="Caixas" style="width:44px;text-align:right;padding:4px 4px;">
+            <span style="color:#8a8374;font-size:10.5px;">cx</span>
+            <input type="number" min="0" step="${conv}" class="editable-qty" data-code="${escapeHtml(it.codigo)}" value="${it.qtdPedida}" title="Unidades" style="width:54px;text-align:right;padding:4px 4px;">
+            <span style="color:#8a8374;font-size:10.5px;">un</span>
+          </div>
+        </td>
       </tr>`;
-    }).join('') || `<tr><td colspan="11" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
+    }).join('') || `<tr><td colspan="8" style="text-align:center;color:#8a8374;">Sem resultados.</td></tr>`;
 
     const totCaixas = rows.reduce((s, i) => s + Math.ceil((i.qtdPedida || 0) / (i.conversaoCaixas || 1)), 0);
     const totUnid = rows.reduce((s, i) => s + (i.qtdPedida || 0), 0);
     const totSugCx = rows.reduce((s, i) => s + i.caixasSugeridas, 0);
-    const totSugUn = rows.reduce((s, i) => s + i.qtdSugerida, 0);
     const totStock = rows.reduce((s, i) => s + i.stockAtual, 0);
     root.querySelector('#pedTfoot').innerHTML = rows.length ? `
       <tr>
         <td colspan="3">Total (${rows.length} artigo${rows.length === 1 ? '' : 's'})</td>
-        <td class="num">—</td><td class="num">—</td>
+        <td class="num">—</td>
         <td class="num">${fmtNum(totStock)}</td><td class="num">—</td>
-        <td class="num">${fmtNum(totSugCx)}</td><td class="num">${fmtNum(totSugUn)}</td>
-        <td class="num">${fmtNum(totCaixas)}</td><td class="num">${fmtNum(totUnid)}</td>
+        <td class="num">${fmtNum(totSugCx)} cx</td>
+        <td class="num">${fmtNum(totCaixas)} cx / ${fmtNum(totUnid)} un</td>
       </tr>` : '';
 
     attachSortableHeaders(root.querySelector('thead'), 'pedido', null, draw);
 
-    // Editar pela coluna "Caixas a pedir" recalcula as unidades (caixas × conversão)
+    // Editar pela coluna "Caixas" recalcula as unidades (caixas × conversão)
     tbody.querySelectorAll('.editable-cx').forEach(inp => {
       inp.addEventListener('change', () => {
         const code = inp.dataset.code;
@@ -1583,7 +1585,7 @@ function renderPedidoScreen(root) {
         draw();
       });
     });
-    // Editar pela coluna "Unidades a pedir" recalcula as caixas (arredondado para cima)
+    // Editar pela coluna "Unidades" recalcula as caixas (arredondado para cima)
     tbody.querySelectorAll('.editable-qty').forEach(inp => {
       inp.addEventListener('change', () => {
         const code = inp.dataset.code;
