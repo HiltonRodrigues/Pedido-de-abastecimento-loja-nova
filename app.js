@@ -446,10 +446,11 @@ function gerarPedidoSugerido({ cardex, stock, mediaPorArtigo, coberturaDias }) {
     const necessidade = vendaMediaDia * coberturaDias - stockAtual;
 
     let caixasSugeridas, qtdSugerida;
-    if (semHistorico && stockAtual === 0) {
-      // Artigo nunca vendido (ou sem dados de venda) e sem stock: sugere
-      // sempre 1 caixa, para garantir que a loja passa a ter o artigo
-      // disponível e a gerar o seu próprio histórico de venda.
+    if (semHistorico) {
+      // Artigo do Cardex nunca vendido (ou sem dados de venda na janela):
+      // sugere sempre 1 caixa, independentemente do stock atual, para
+      // garantir que a loja passa a ter o artigo disponível e a gerar o
+      // seu próprio histórico de venda.
       caixasSugeridas = 1;
       qtdSugerida = conv;
     } else {
