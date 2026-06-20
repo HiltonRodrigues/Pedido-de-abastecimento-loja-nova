@@ -391,28 +391,33 @@ function calcularVendaMedia(vendasItemsRaw, janelaDias, opts = {}) {
   limite.setDate(limite.getDate() - janelaDias + 1);
 
   if (lojaNova) {
-    // Loja sem histórico próprio: a venda esperada por artigo é a média das
-    // lojas que já vendem esse artigo — soma-se a venda de todas as lojas
-    // no período, divide-se pelos dias (venda média diária da rede) e
-    // depois pelo número de lojas distintas que tiveram movimento desse
-    // artigo (não todas as lojas da rede, só as que venderam).
-    const porArtigo = {}; // { total, lojas:Set }
+    // Loja sem histórico próprio: a venda esperada por artigo é a venda
+    // média diária somada de todas as lojas da rede, dividida pelo número
+    // TOTAL de lojas da rede presentes no ficheiro — incluindo as que não
+    // venderam esse artigo específico (assume-se que, em média, todas as
+    // lojas da rede teriam potencial para vender o artigo).
+    const todasAsLojas = new Set();
+    for (const v of vendasItems) {
+      if (v.data < limite) continue;
+      todasAsLojas.add(normKey(v.loja || 'SEM_LOJA'));
+    }
+    const totalLojasRede = todasAsLojas.size || 1;
+
+    const porArtigo = {}; // { total }
     for (const v of vendasItems) {
       if (v.data < limite) continue;
       const k = normKey(v.codigo);
-      if (!porArtigo[k]) porArtigo[k] = { total: 0, lojas: new Set() };
+      if (!porArtigo[k]) porArtigo[k] = { total: 0 };
       porArtigo[k].total += v.quantidade;
-      porArtigo[k].lojas.add(normKey(v.loja || 'SEM_LOJA'));
     }
     const out = {};
     const nLojasPorArtigo = {};
     for (const k in porArtigo) {
-      const nLojas = porArtigo[k].lojas.size || 1;
       const mediaRede = porArtigo[k].total / janelaDias; // venda média diária somada de todas as lojas
-      out[k] = mediaRede / nLojas; // venda média diária esperada para 1 loja (a nova)
-      nLojasPorArtigo[k] = nLojas;
+      out[k] = mediaRede / totalLojasRede; // venda média diária esperada para 1 loja (a nova)
+      nLojasPorArtigo[k] = totalLojasRede;
     }
-    return { mediaPorArtigo: out, dataLimite: limite, dataMax: hoje, nLojasPorArtigo, lojaNova: true };
+    return { mediaPorArtigo: out, dataLimite: limite, dataMax: hoje, nLojasPorArtigo, totalLojasRede, lojaNova: true };
   }
 
   const porArtigo = {};
@@ -672,7 +677,7 @@ function renderConfigScreen(root) {
               <input type="checkbox" id="inpLojaNova" style="width:auto;" ${STATE.config.lojaNova ? 'checked' : ''}>
               Loja nova (ainda sem histórico de vendas próprio)
             </label>
-            <div class="help">Se ativo, a venda média de cada artigo passa a ser calculada a partir das outras lojas: venda média diária da rede ÷ número de lojas que vendem esse artigo. Para isto funcionar, o ficheiro de vendas precisa de ter uma coluna a identificar a loja de cada venda.</div>
+            <div class="help">Se ativo, a venda média de cada artigo passa a ser calculada a partir das outras lojas: venda média diária da rede ÷ número total de lojas da rede (todas, mesmo as que não venderam esse artigo). Para isto funcionar, o ficheiro de vendas precisa de ter uma coluna a identificar a loja de cada venda.</div>
           </div>
           <div class="field-row">
             <label class="field">Atenuação do reforço por categoria (0 a 1)</label>
@@ -1270,7 +1275,7 @@ function renderVendasTable(container) {
     <div class="panel">
       ${STATE.config.lojaNova ? `
         <div class="banner info">
-          🏬 <b>Modo loja nova ativo:</b> a venda média de cada artigo é calculada a partir da venda média da rede dividida pelo número de lojas que já vendem esse artigo — não pelo histórico próprio desta loja (que ainda não existe). Pode desligar este modo no passo 0.
+          🏬 <b>Modo loja nova ativo:</b> a venda média de cada artigo é calculada a partir da venda média da rede dividida pelo número total de lojas da rede (todas, incluindo as que não venderam esse artigo) — não pelo histórico próprio desta loja (que ainda não existe). Pode desligar este modo no passo 0.
         </div>` : ''}
       ${items.length ? `
         <div class="banner info">
@@ -1289,7 +1294,7 @@ function renderVendasTable(container) {
         <div class="search-box">🔎 <input type="text" id="vendasSearch" placeholder="Procurar código…"></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Código</th><th>Descrição</th>${STATE.config.lojaNova ? '<th class="num">Nº lojas com venda</th>' : ''}<th class="num">Venda média/dia (un)</th><th class="num">Venda média/dia (cx)</th><th class="num">Total no período (un)</th></tr></thead>
+        <thead><tr><th>Código</th><th>Descrição</th>${STATE.config.lojaNova ? '<th class="num">Total lojas da rede</th>' : ''}<th class="num">Venda média/dia (un)</th><th class="num">Venda média/dia (cx)</th><th class="num">Total no período (un)</th></tr></thead>
         <tbody id="vendasTbody"></tbody>
       </table></div>
       <div class="btn-row">
