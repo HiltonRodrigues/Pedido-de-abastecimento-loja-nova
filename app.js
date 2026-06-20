@@ -33,7 +33,7 @@ const STATE = {
 const STEPS = [
   { key: 'config',   title: 'Ligação de dados' },
   { key: 'cardex',   title: '1 · Cardex' },
-  { key: 'stock',    title: '2 · Stock' },
+  { key: 'stock',    title: '2 · Stock CD' },
   { key: 'vendas',   title: '3 · Vendas' },
   { key: 'pedido',   title: '4 · Pedido sugerido' },
   { key: 'servico',  title: '5 · Nível de serviço' },
